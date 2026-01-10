@@ -308,32 +308,32 @@ class TaskipelagoContext(CommonClient.CommonContext):
     def on_package(self, cmd: str, args: dict):
         super().on_package(cmd, args)
 
+        # Merge any server-provided checked locations (can be full or partial)
+        if "checked_locations" in args and isinstance(args["checked_locations"], (list, set, tuple)):
+            self.checked_locations_set.update(args["checked_locations"])
+
+        # Merge whatever the base context currently knows (cumulative if present)
+        base_checked = getattr(self, "locations_checked", None)
+        if isinstance(base_checked, set):
+            self.checked_locations_set.update(base_checked)
+
         if cmd == "Connected":
             self.apply_slot_data(args.get("slot_data", {}))
 
-            # Populate checked locations immediately from Connected payload
-            self.checked_locations_set = set(args.get("checked_locations", []))
+            async def _double_sync():
+                # First sync immediately
+                await self.send_msgs([{"cmd": "Sync"}])
+                # Second sync shortly after (covers timing quirks)
+                await asyncio.sleep(0.25)
+                await self.send_msgs([{"cmd": "Sync"}])
 
-            # Ask server to send full state again (safe even if redundant)
-            asyncio.create_task(self.send_msgs([{"cmd": "Sync"}]))
+            asyncio.create_task(_double_sync())
 
+        if cmd in ("Connected", "RoomUpdate", "Sync", "ReceivedItems"):
             if callable(self.on_state_changed):
                 self.on_state_changed()
-            return
 
-        if cmd == "RoomUpdate":
-            if "checked_locations" in args:
-                # RoomUpdate may be delta OR full list; union works for both
-                self.checked_locations_set.update(args["checked_locations"])
 
-            if callable(self.on_state_changed):
-                self.on_state_changed()
-            return
-
-        if cmd == "ReceivedItems":
-            if callable(self.on_state_changed):
-                self.on_state_changed()
-            return
 
 async def server_loop(ctx: TaskipelagoContext, address: str):
     import websockets  # lazy import
@@ -369,7 +369,6 @@ class TaskipelagoApp(tk.Tk):
         self.task_vars = {} # location_id -> BooleanVar
         self.task_widgets = {}
         self.connection_state = "disconnected"  # disconnected | connecting | connected
-        self.task_reward_labels = {}  # location_id -> Label
 
         self.colors = apply_dark_theme(self)
         ScrollableFrame.bind_mousewheel_to_root(self)
@@ -545,6 +544,8 @@ class TaskipelagoApp(tk.Tk):
             self.ctx.death_link_pool = []
             self.ctx.death_link_enabled = False
             self.ctx.checked_locations_set = set()
+            if hasattr(self.ctx, "locations_checked"):
+                self.ctx.locations_checked = set()
         self.refresh_play_tab()
 
     
@@ -710,30 +711,10 @@ class TaskipelagoApp(tk.Tk):
                 )
                 btn.pack(side="right", padx=(10, 0))
 
-            # ---- Row 2: Reward line (only shown once completed) ----
-            if completed:
-                reward = self._reward_text_for_location(loc_id) or "Unlocked: (pending...)"
-                reward_label = tk.Label(
-                    card,
-                    text=reward,
-                    bg=panel,
-                    fg="#4ade80",            # green
-                    font=("Segoe UI", 10),
-                    wraplength=700,
-                    justify="left",
-                    anchor="w"
-                )
-                reward_label.pack(fill="x", padx=28, pady=(0, 8))
-            else:
-                # keep bottom padding consistent even when not completed
-                spacer = tk.Frame(card, bg=panel, height=6)
-                spacer.pack(fill="x")
+            self._bind_mousewheel_recursive(card, self.play_tasks_scroll)
 
-            self._bind_mousewheel_to_widget(card, self.play_tasks_scroll)
-            self._bind_mousewheel_to_widget(top, self.play_tasks_scroll)
-            self._bind_mousewheel_to_widget(task_label, self.play_tasks_scroll)
-            if completed:
-                self._bind_mousewheel_to_widget(reward_label, self.play_tasks_scroll)
+            spacer = tk.Frame(card, bg=panel, height=6)
+            spacer.pack(fill="x")
 
     def complete_task(self, location_id: int):
         if location_id in self.pending_locations or location_id in self.ctx.checked_locations_set:
@@ -793,37 +774,6 @@ class TaskipelagoApp(tk.Tk):
             )
 
         self.after(0, self._clear_play_state)
-
-    def _reward_text_for_location(self, loc_id: int):
-        for it in getattr(self.ctx, "items_received", []):
-            if getattr(it, "location", None) == loc_id:
-                item_id = getattr(it, "item", None)
-
-                name = None
-                try:
-                    name = Utils.get_item_name_from_id(item_id, self.ctx.game)
-                except Exception:
-                    pass
-
-                if not name:
-                    # fallback: try ctx.item_names structures across versions
-                    try:
-                        obj = getattr(self.ctx, "item_names", None)
-                        if isinstance(obj, dict):
-                            name = obj.get(item_id)
-                        elif hasattr(obj, "get"):
-                            name = obj.get(item_id)
-                        elif hasattr(obj, "__getitem__"):
-                            name = obj[item_id]
-                    except Exception:
-                        name = None
-
-                if not name:
-                    name = f"Item ID {item_id}"
-
-                return f"Unlocked: {name}"
-        return None
-
     
     def _bind_mousewheel_to_widget(self, widget, scroll: ScrollableFrame):
         # Windows / macOS
@@ -831,6 +781,14 @@ class TaskipelagoApp(tk.Tk):
         # Linux
         widget.bind("<Button-4>", lambda e: scroll.canvas.yview_scroll(-1, "units"), add=True)
         widget.bind("<Button-5>", lambda e: scroll.canvas.yview_scroll(1, "units"), add=True)
+
+    def _bind_mousewheel_recursive(self, root_widget, scroll: ScrollableFrame):
+        # bind this widget
+        self._bind_mousewheel_to_widget(root_widget, scroll)
+        # bind all descendants
+        for child in root_widget.winfo_children():
+            self._bind_mousewheel_recursive(child, scroll)
+
 
 
 
