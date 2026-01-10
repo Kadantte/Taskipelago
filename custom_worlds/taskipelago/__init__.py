@@ -5,6 +5,7 @@ from typing import Dict, List, Any
 from BaseClasses import Item, ItemClassification, Location, Region
 from worlds.AutoWorld import World, WebWorld
 from worlds.LauncherComponents import Component, Type, components, launch_subprocess
+from worlds.generic.Rules import set_rule
 
 from .options import TaskipelagoOptions
 
@@ -88,8 +89,31 @@ class TaskipelagoWorld(World):
             )
 
     def set_rules(self) -> None:
-        # No access rules; tasks are client-checked.
-        pass
+        if not self.options.lock_prereqs.value:
+            return
+        
+        prereqs = [str(x).strip() for x in self.options.task_prereqs.value]
+        for i, prereq_text in enumerate(prereqs):
+            if not prereq_text:
+                continue
+            loc_name = self._location_names[i]
+            loc = self.multiworld.get_location(loc_name, self.player)
+
+            prereq_indices = []
+            for p in prereq_text.split(","):
+                p = p.strip()
+                if p.isdigit():
+                    prereq_indices.append(int(p) - 1)
+
+            prereq_locs = []
+            for pi in prereq_indices:
+                if 0 <= pi < len(self._location_names):
+                    prereq_locs.append(self.multiworld.get_location(self._location_names[pi], self.player))
+
+            def rule(state, prereq_locs=prereq_locs):
+                return all(pl in state.locations_checked for pl in prereq_locs)
+
+            set_rule(loc, rule)
 
     def generate_basic(self) -> None:
         my_locations = [self.multiworld.get_location(name, self.player) for name in self._location_names]
