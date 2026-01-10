@@ -105,6 +105,7 @@ class TaskipelagoWorld(World):
             "death_link_pool": [str(x).strip() for x in self.options.death_link_pool.value if str(x).strip()],
             "death_link_enabled": bool(self.options.death_link),
             "base_location_id": BASE_LOCATION_ID,
+            "base_item_id": BASE_ITEM_ID,
         }
 
 def launch_client(*args):

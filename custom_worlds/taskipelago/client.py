@@ -290,6 +290,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.tasks = []
         self.rewards = []
         self.base_location_id = None
+        self.base_item_id = None
         self.death_link_pool = []
         self.death_link_enabled = False
         self.checked_locations_set = set()
@@ -309,6 +310,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.tasks = list(self.slot_data.get("tasks", []))
         self.rewards = list(self.slot_data.get("rewards", []))
         self.base_location_id = self.slot_data.get("base_location_id")
+        self.base_item_id = self.slot_data.get("base_item_id")
         self.death_link_pool = list(self.slot_data.get("death_link_pool", []))
         self.death_link_enabled = bool(self.slot_data.get("death_link_enabled", False))
 
@@ -978,7 +980,16 @@ class TaskipelagoApp(tk.Tk):
                 except Exception:
                     name = None
             if not name:
-                name = f"Item ID {item_id}"
+                # If it's a Taskipelago reward item, resolve via rewards list
+                base = getattr(self.ctx, "base_item_id", None)
+                rewards = getattr(self.ctx, "rewards", []) or []
+                resolved = None
+                if isinstance(base, int) and isinstance(item_id, int):
+                    idx = item_id - base
+                    if 0 <= idx < len(rewards):
+                        resolved = rewards[idx]
+
+                name = resolved or f"Item ID {item_id}"
 
             # dedupe
             key = (item_id, sender, loc)
