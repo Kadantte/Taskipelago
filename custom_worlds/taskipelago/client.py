@@ -133,9 +133,18 @@ class ScrollableFrame(ttk.Frame):
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mouse wheel scrolling
-        self._bind_mousewheel(self.canvas)
-        self._bind_mousewheel(self.inner)
+        # Activate this scroll area when mouse enters it
+        self.canvas.bind("<Enter>", lambda _e: self._set_active(True))
+        self.canvas.bind("<Leave>", lambda _e: self._set_active(False))
+        self.inner.bind("<Enter>", lambda _e: self._set_active(True))
+        self.inner.bind("<Leave>", lambda _e: self._set_active(False))
+
+        # Linux wheel support
+        self.canvas.bind("<Button-4>", lambda e: self._on_mousewheel_linux(-1))
+        self.canvas.bind("<Button-5>", lambda e: self._on_mousewheel_linux(1))
+        self.inner.bind("<Button-4>", lambda e: self._on_mousewheel_linux(-1))
+        self.inner.bind("<Button-5>", lambda e: self._on_mousewheel_linux(1))
+
 
     def _on_scroll(self, first, last):
         self.vsb.set(first, last)
@@ -166,12 +175,37 @@ class ScrollableFrame(ttk.Frame):
         else:
             self.vsb.grid_remove()
 
-    def _bind_mousewheel(self, widget):
-        widget.bind("<Enter>", lambda _e: widget.bind_all("<MouseWheel>", self._on_mousewheel))
-        widget.bind("<Leave>", lambda _e: widget.unbind_all("<MouseWheel>"))
-
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+        _active_scroll = None  # class-level pointer
+
+    def _set_active(self, active: bool):
+        if active:
+            ScrollableFrame._active_scroll = self
+        elif ScrollableFrame._active_scroll is self:
+            ScrollableFrame._active_scroll = None
+
+    @classmethod
+    def bind_mousewheel_to_root(cls, root: tk.Misc):
+        # Windows / macOS
+        root.bind_all("<MouseWheel>", cls._dispatch_mousewheel, add=True)
+
+    @classmethod
+    def _dispatch_mousewheel(cls, event):
+        if cls._active_scroll is None:
+            return
+        cls._active_scroll._on_mousewheel(event)
+
+    def _on_mousewheel(self, event):
+        # Windows wheel delta is 120 per notch; macOS varies but sign is correct
+        delta = int(-1 * (event.delta / 120)) if event.delta else 0
+        if delta:
+            self.canvas.yview_scroll(delta, "units")
+
+    def _on_mousewheel_linux(self, direction: int):
+        # direction: -1 up, +1 down
+        self.canvas.yview_scroll(direction, "units")
 
 
 # ----------------------------
@@ -276,10 +310,16 @@ class TaskipelagoContext(CommonClient.CommonContext):
 
         if cmd == "Connected":
             self.apply_slot_data(args.get("slot_data", {}))
+            
+            async def _sync():
+                await self.send_msgs([{"cmd": "Sync"}])
+
+            asyncio.create_task(_sync())
+
             if callable(self.on_state_changed):
                 self.on_state_changed()
             return
-
+        
         # These packets are when your checked locations/items actually change
         if cmd in ("RoomUpdate", "ReceivedItems"):
             if callable(self.on_state_changed):
@@ -322,6 +362,7 @@ class TaskipelagoApp(tk.Tk):
         self.task_reward_labels = {}  # location_id -> Label
 
         self.colors = apply_dark_theme(self)
+        ScrollableFrame.bind_mousewheel_to_root(self)
 
         self.task_rows = []
         self.deathlink_rows = []
@@ -350,7 +391,9 @@ class TaskipelagoApp(tk.Tk):
 
         self.loop.call_soon_threadsafe(_init_ctx)
 
-        # Buiild the UI
+        self.pending_locations = set()  # location_ids we've sent checks for, awaiting server confirmation
+
+        # Build the UI
         self.build_ui()
 
     def build_ui(self):
@@ -479,6 +522,8 @@ class TaskipelagoApp(tk.Tk):
 
         self.play_tasks_scroll = ScrollableFrame(tasks_frame, colors=self.colors)
         self.play_tasks_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        self._bind_mousewheel_to_widget(self.play_tasks_scroll.canvas, self.play_tasks_scroll)
+        self._bind_mousewheel_to_widget(self.play_tasks_scroll.inner, self.play_tasks_scroll)
 
     def on_connect_toggle(self):
         if self.connection_state == "disconnected":
@@ -577,100 +622,108 @@ class TaskipelagoApp(tk.Tk):
             self.connect_status.set("Connected.")
             self.connect_button.config(text="Disconnect")
 
+        # Remove any pending entries that have been confirmed by the server
+        checked = getattr(self.ctx, "locations_checked", set())
+        self.pending_locations = {lid for lid in self.pending_locations if lid not in checked}
+
+        # render
         self.after(0, self.refresh_play_tab)
 
     def refresh_play_tab(self):
-    for child in self.play_tasks_scroll.inner.winfo_children():
-        child.destroy()
+        for child in self.play_tasks_scroll.inner.winfo_children():
+            child.destroy()
 
-    if not getattr(self, "ctx", None) or not self.ctx.tasks or self.ctx.base_location_id is None:
-        return
+        if not getattr(self, "ctx", None) or not self.ctx.tasks or self.ctx.base_location_id is None:
+            return
 
-    panel = self.colors.get("panel", "#252526")
-    border = self.colors.get("border", "#3a3a3a")
-    fg = self.colors.get("fg", "#e6e6e6")
-    muted = self.colors.get("muted", "#bdbdbd")
+        panel = self.colors.get("panel", "#252526")
+        border = self.colors.get("border", "#3a3a3a")
+        fg = self.colors.get("fg", "#e6e6e6")
+        muted = self.colors.get("muted", "#bdbdbd")
 
-    for i, task_name in enumerate(self.ctx.tasks):
-        loc_id = self.ctx.base_location_id + i
-        completed = loc_id in getattr(self.ctx, "locations_checked", set())
+        for i, task_name in enumerate(self.ctx.tasks):
+            loc_id = self.ctx.base_location_id + i
+            completed = (loc_id in getattr(self.ctx, "locations_checked", set())) or (loc_id in self.pending_locations)
 
-        # ---- Box container ----
-        card = tk.Frame(
-            self.play_tasks_scroll.inner,
-            bg=panel,
-            highlightbackground=border,
-            highlightthickness=1
-        )
-        card.pack(fill="x", pady=6, padx=4)
-
-        # ---- Row 1: Task text + button ----
-        top = tk.Frame(card, bg=panel)
-        top.pack(fill="x", padx=10, pady=(8, 2))
-
-        display_text = task_name
-        task_color = fg
-        if completed:
-            display_text = "✔ " + task_name
-            task_color = muted
-
-        task_label = tk.Label(
-            top,
-            text=display_text,
-            bg=panel,
-            fg=task_color,
-            font=("Segoe UI", 12),     # bigger
-            wraplength=720,
-            justify="left",
-            anchor="w"
-        )
-        task_label.pack(side="left", fill="x", expand=True)
-
-        if not completed:
-            btn = ttk.Button(
-                top,
-                text="Complete",
-                command=lambda lid=loc_id: self.complete_task(lid)
-            )
-            btn.pack(side="right", padx=(10, 0))
-
-        # ---- Row 2: Reward line (only shown once completed) ----
-        if completed:
-            reward = self._reward_text_for_location(loc_id) or "Unlocked: (pending...)"
-            reward_label = tk.Label(
-                card,
-                text=reward,
+            # ---- Box container ----
+            card = tk.Frame(
+                self.play_tasks_scroll.inner,
                 bg=panel,
-                fg="#4ade80",            # green
-                font=("Segoe UI", 10),
-                wraplength=700,
+                highlightbackground=border,
+                highlightthickness=1
+            )
+            card.pack(fill="x", pady=6, padx=4)
+
+            # ---- Row 1: Task text + button ----
+            top = tk.Frame(card, bg=panel)
+            top.pack(fill="x", padx=10, pady=(8, 2))
+
+            display_text = task_name
+            task_color = fg
+            if completed:
+                display_text = "✔ " + task_name
+                task_color = muted
+
+            task_label = tk.Label(
+                top,
+                text=display_text,
+                bg=panel,
+                fg=task_color,
+                font=("Segoe UI", 12),     # bigger
+                wraplength=720,
                 justify="left",
                 anchor="w"
             )
-            reward_label.pack(fill="x", padx=28, pady=(0, 8))
-        else:
-            # keep bottom padding consistent even when not completed
-            spacer = tk.Frame(card, bg=panel, height=6)
-            spacer.pack(fill="x")
+            task_label.pack(side="left", fill="x", expand=True)
+
+            if not completed:
+                btn = ttk.Button(
+                    top,
+                    text="Complete",
+                    command=lambda lid=loc_id: self.complete_task(lid)
+                )
+                btn.pack(side="right", padx=(10, 0))
+
+            # ---- Row 2: Reward line (only shown once completed) ----
+            if completed:
+                reward = self._reward_text_for_location(loc_id) or "Unlocked: (pending...)"
+                reward_label = tk.Label(
+                    card,
+                    text=reward,
+                    bg=panel,
+                    fg="#4ade80",            # green
+                    font=("Segoe UI", 10),
+                    wraplength=700,
+                    justify="left",
+                    anchor="w"
+                )
+                reward_label.pack(fill="x", padx=28, pady=(0, 8))
+            else:
+                # keep bottom padding consistent even when not completed
+                spacer = tk.Frame(card, bg=panel, height=6)
+                spacer.pack(fill="x")
+
+            self._bind_mousewheel_to_widget(card, self.play_tasks_scroll)
+            self._bind_mousewheel_to_widget(top, self.play_tasks_scroll)
+            self._bind_mousewheel_to_widget(task_label, self.play_tasks_scroll)
+            if completed:
+                self._bind_mousewheel_to_widget(reward_label, self.play_tasks_scroll)
 
     def complete_task(self, location_id: int):
-        if location_id in self.ctx.locations_checked:
-            return  # hard lock
+        if location_id in self.pending_locations or location_id in self.ctx.locations_checked:
+            return
+
+        # Immediate UI feedback
+        self.pending_locations.add(location_id)
+        self.refresh_play_tab()
 
         async def _send():
             await self.ctx.send_msgs([
-                {
-                    "cmd": "LocationChecks",
-                    "locations": [location_id]
-                }
+                {"cmd": "LocationChecks", "locations": [location_id]}
             ])
 
-        self.loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(_send())
-        )
+        self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
-        # an optimistic refresh
-        self.after(200, self.refresh_play_tab)
 
 
     def _start_connect(self):
@@ -713,20 +766,34 @@ class TaskipelagoApp(tk.Tk):
                 lambda: asyncio.create_task(_do_disconnect())
             )
 
-    def _reward_text_for_location(self, loc_id: int) -> str | None:
-        # ctx.items_received is a list of NetworkItem objects
+    def _reward_text_for_location(self, loc_id: int):
         for it in getattr(self.ctx, "items_received", []):
             if getattr(it, "location", None) == loc_id:
                 item_id = getattr(it, "item", None)
 
-                # Try to resolve item name nicely; fall back to ID
+                # Best-effort name resolution across AP versions
+                name = None
                 try:
-                    name = self.ctx.item_names.get(item_id, f"Item {item_id}")
+                    # CommonContext has item_names lookup sometimes
+                    if hasattr(self.ctx, "item_names") and isinstance(self.ctx.item_names, dict):
+                        name = self.ctx.item_names.get(item_id)
                 except Exception:
-                    name = f"Item {item_id}"
+                    pass
+
+                if not name:
+                    name = f"Item ID {item_id}"
 
                 return f"Unlocked: {name}"
         return None
+    
+    def _bind_mousewheel_to_widget(self, widget, scroll: ScrollableFrame):
+        # Windows / macOS
+        widget.bind("<MouseWheel>", lambda e: scroll.canvas.yview_scroll(int(-e.delta / 120), "units"), add=True)
+        # Linux
+        widget.bind("<Button-4>", lambda e: scroll.canvas.yview_scroll(-1, "units"), add=True)
+        widget.bind("<Button-5>", lambda e: scroll.canvas.yview_scroll(1, "units"), add=True)
+
+
 
 
 if __name__ == "__main__":
