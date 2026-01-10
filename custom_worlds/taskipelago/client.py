@@ -104,7 +104,7 @@ def apply_dark_theme(root: tk.Tk):
         foreground="#4ade80"  # green
     )
 
-    return {"bg": bg}
+    return {"bg": bg, "panel": panel, "border": border, "fg": fg, "muted": muted}
 
 
 # ----------------------------
@@ -271,8 +271,19 @@ class TaskipelagoContext(CommonClient.CommonContext):
             self.on_state_changed()
 
     def on_package(self, cmd: str, args: dict):
+        # Let base context do its normal bookkeeping
+        super().on_package(cmd, args)
+
         if cmd == "Connected":
             self.apply_slot_data(args.get("slot_data", {}))
+            if callable(self.on_state_changed):
+                self.on_state_changed()
+            return
+
+        # These packets are when your checked locations/items actually change
+        if cmd in ("RoomUpdate", "ReceivedItems"):
+            if callable(self.on_state_changed):
+                self.on_state_changed()
 
 async def server_loop(ctx: TaskipelagoContext, address: str):
     import websockets  # lazy import
@@ -569,59 +580,78 @@ class TaskipelagoApp(tk.Tk):
         self.after(0, self.refresh_play_tab)
 
     def refresh_play_tab(self):
-        for child in self.play_tasks_scroll.inner.winfo_children():
-            child.destroy()
+    for child in self.play_tasks_scroll.inner.winfo_children():
+        child.destroy()
 
-        self.task_widgets.clear()
-        self.task_reward_labels.clear()
+    if not getattr(self, "ctx", None) or not self.ctx.tasks or self.ctx.base_location_id is None:
+        return
 
-        if not self.ctx.tasks or self.ctx.base_location_id is None:
-            return
+    panel = self.colors.get("panel", "#252526")
+    border = self.colors.get("border", "#3a3a3a")
+    fg = self.colors.get("fg", "#e6e6e6")
+    muted = self.colors.get("muted", "#bdbdbd")
 
-        for i, task_name in enumerate(self.ctx.tasks):
-            loc_id = self.ctx.base_location_id + i
-            completed = loc_id in self.ctx.locations_checked
+    for i, task_name in enumerate(self.ctx.tasks):
+        loc_id = self.ctx.base_location_id + i
+        completed = loc_id in getattr(self.ctx, "locations_checked", set())
 
-            container = ttk.Frame(self.play_tasks_scroll.inner)
-            container.pack(fill="x", pady=6)
+        # ---- Box container ----
+        card = tk.Frame(
+            self.play_tasks_scroll.inner,
+            bg=panel,
+            highlightbackground=border,
+            highlightthickness=1
+        )
+        card.pack(fill="x", pady=6, padx=4)
 
-            # --- Task text ---
-            task_label = ttk.Label(
-                container,
-                text=task_name,
-                style="Task.TLabel",
-                wraplength=640
+        # ---- Row 1: Task text + button ----
+        top = tk.Frame(card, bg=panel)
+        top.pack(fill="x", padx=10, pady=(8, 2))
+
+        display_text = task_name
+        task_color = fg
+        if completed:
+            display_text = "✔ " + task_name
+            task_color = muted
+
+        task_label = tk.Label(
+            top,
+            text=display_text,
+            bg=panel,
+            fg=task_color,
+            font=("Segoe UI", 12),     # bigger
+            wraplength=720,
+            justify="left",
+            anchor="w"
+        )
+        task_label.pack(side="left", fill="x", expand=True)
+
+        if not completed:
+            btn = ttk.Button(
+                top,
+                text="Complete",
+                command=lambda lid=loc_id: self.complete_task(lid)
             )
-            task_label.pack(anchor="w")
+            btn.pack(side="right", padx=(10, 0))
 
-            # --- Reward line (hidden unless completed) ---
-            reward_label = ttk.Label(
-                container,
-                text="",  # filled when item received
-                style="Reward.TLabel",
-                wraplength=600
+        # ---- Row 2: Reward line (only shown once completed) ----
+        if completed:
+            reward = self._reward_text_for_location(loc_id) or "Unlocked: (pending...)"
+            reward_label = tk.Label(
+                card,
+                text=reward,
+                bg=panel,
+                fg="#4ade80",            # green
+                font=("Segoe UI", 10),
+                wraplength=700,
+                justify="left",
+                anchor="w"
             )
-            reward_label.pack(anchor="w", padx=(18, 0), pady=(2, 0))
-            reward_label.pack_forget()
-
-            self.task_reward_labels[loc_id] = reward_label
-
-            if completed:
-                task_label.configure(
-                    style="TaskDone.TLabel",
-                    text="✔ " + task_name.replace("", "\u0336")[:-1]
-                )
-                reward_label.pack(anchor="w", padx=(18, 0), pady=(2, 0))
-            else:
-                btn = ttk.Button(
-                    container,
-                    text="Complete",
-                    command=lambda lid=loc_id: self.complete_task(lid)
-                )
-                btn.pack(anchor="e", pady=(4, 0))
-
-            self.task_widgets[loc_id] = container
-
+            reward_label.pack(fill="x", padx=28, pady=(0, 8))
+        else:
+            # keep bottom padding consistent even when not completed
+            spacer = tk.Frame(card, bg=panel, height=6)
+            spacer.pack(fill="x")
 
     def complete_task(self, location_id: int):
         if location_id in self.ctx.locations_checked:
@@ -680,7 +710,20 @@ class TaskipelagoApp(tk.Tk):
                 lambda: asyncio.create_task(_do_disconnect())
             )
 
+    def _reward_text_for_location(self, loc_id: int) -> str | None:
+        # ctx.items_received is a list of NetworkItem objects
+        for it in getattr(self.ctx, "items_received", []):
+            if getattr(it, "location", None) == loc_id:
+                item_id = getattr(it, "item", None)
 
+                # Try to resolve item name nicely; fall back to ID
+                try:
+                    name = self.ctx.item_names.get(item_id, f"Item {item_id}")
+                except Exception:
+                    name = f"Item {item_id}"
+
+                return f"Unlocked: {name}"
+        return None
 
 
 if __name__ == "__main__":
