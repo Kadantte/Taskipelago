@@ -1,9 +1,7 @@
 import asyncio
-import logging
 import random
 import threading
 import time
-import urllib.parse
 from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
@@ -11,7 +9,6 @@ from tkinter import ttk
 import yaml
 
 import CommonClient
-import Utils
 from NetUtils import Endpoint, decode
 
 RANDOM_TOKEN = "nothing here, get pranked nerd"
@@ -60,7 +57,6 @@ def apply_dark_theme(root: tk.Tk):
         foreground=[("readonly", fg)],
     )
 
-    # Prevent white hover flash on checkbuttons
     style.configure("TCheckbutton", background=bg, foreground=fg)
     style.map(
         "TCheckbutton",
@@ -68,7 +64,6 @@ def apply_dark_theme(root: tk.Tk):
         foreground=[("active", fg), ("pressed", fg), ("focus", fg), ("selected", fg)],
     )
 
-    # Notebook styling
     style.configure("TNotebook", background="#2b2b2b", borderwidth=0)
     style.configure("TNotebook.Tab", padding=(14, 6), background="#3a3a3a", foreground="#dddddd", borderwidth=0)
     style.map("TNotebook.Tab", background=[("selected", "#4a4a4a")], foreground=[("selected", "#ffffff")])
@@ -80,7 +75,7 @@ def apply_dark_theme(root: tk.Tk):
 # Scrollable container (auto-hide scrollbar)
 # ----------------------------
 class ScrollableFrame(ttk.Frame):
-    _active_scroll = None  # class pointer for wheel routing
+    _active_scroll = None
 
     def __init__(self, parent, colors=None):
         super().__init__(parent)
@@ -103,13 +98,9 @@ class ScrollableFrame(ttk.Frame):
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Activate wheel when mouse is over this scroll region
         for w in (self.canvas, self.inner):
             w.bind("<Enter>", lambda _e, self=self: self._set_active(True))
             w.bind("<Leave>", lambda _e, self=self: self._set_active(False))
-
-        # Linux wheel
-        for w in (self.canvas, self.inner):
             w.bind("<Button-4>", lambda e, self=self: self._on_mousewheel_linux(-1))
             w.bind("<Button-5>", lambda e, self=self: self._on_mousewheel_linux(1))
 
@@ -181,9 +172,9 @@ class TaskRow:
         self.filler_var = tk.BooleanVar()
 
         self._saved_reward = ""
-        
+
         self.num_label = ttk.Label(self.frame, text=str(index), width=3)
-        self.num_label.grid(row=0, column=0, padx=(0, 8), sticky ="w")
+        self.num_label.grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         ttk.Entry(self.frame, textvariable=self.task_var).grid(row=0, column=1, padx=(0, 8), sticky="ew")
         ttk.Entry(self.frame, textvariable=self.reward_var).grid(row=0, column=2, padx=(0, 8), sticky="ew")
@@ -248,32 +239,34 @@ class DeathLinkRow:
 # ----------------------------
 class TaskipelagoContext(CommonClient.CommonContext):
     game = "Taskipelago"
-    items_handling = 0b111  # receive all items
+    items_handling = 0b111
 
     def __init__(self, server_address=None, password=None):
         super().__init__(server_address, password)
         self.slot_data = {}
+
         self.tasks = []
         self.rewards = []
         self.task_prereqs = []
         self.lock_prereqs = False
 
-        self.base_location_id = None
+        self.base_reward_location_id = None
+        self.base_complete_location_id = None
         self.base_item_id = None
 
         self.death_link_pool = []
         self.death_link_enabled = False
 
         self.checked_locations_set = set()
+
         self.on_disconnected = None
+        self.on_state_changed = None
 
         self.on_deathlink = None
         self._deathlink_tag_enabled = False
 
         self.on_item_received = None
         self._last_item_index = 0
-
-        self.on_state_changed = None
 
     def apply_slot_data(self, slot_data: dict):
         self.slot_data = slot_data or {}
@@ -282,7 +275,8 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.task_prereqs = list(self.slot_data.get("task_prereqs", []))
         self.lock_prereqs = bool(self.slot_data.get("lock_prereqs", False))
 
-        self.base_location_id = self.slot_data.get("base_location_id")
+        self.base_reward_location_id = self.slot_data.get("base_reward_location_id")
+        self.base_complete_location_id = self.slot_data.get("base_complete_location_id")
         self.base_item_id = self.slot_data.get("base_item_id")
 
         self.death_link_pool = list(self.slot_data.get("death_link_pool", []))
@@ -341,7 +335,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
 
 
 async def server_loop(ctx: TaskipelagoContext, address: str):
-    import websockets  # lazy import
+    import websockets
 
     address = f"ws://{address}" if "://" not in address else address
 
@@ -377,10 +371,9 @@ class TaskipelagoApp(tk.Tk):
         ScrollableFrame.bind_mousewheel_to_root(self)
 
         # Connection/UI state
-        self.connection_state = "disconnected"  # disconnected | connecting | connected
+        self.connection_state = "disconnected"
         self.sent_goal = False
-        self.total_task_count = 0
-        self.pending_locations = set()
+        self.pending_reward_locations = set()  # only track reward loc pending (UI completion)
 
         # Dedupe popups
         self._last_deathlink_key = None
@@ -408,7 +401,6 @@ class TaskipelagoApp(tk.Tk):
         t = threading.Thread(target=self._run_async_loop, daemon=True)
         t.start()
 
-        # Context init inside loop
         def _init_ctx():
             self.ctx = TaskipelagoContext()
             self.ctx.on_state_changed = self.on_network_update
@@ -422,7 +414,7 @@ class TaskipelagoApp(tk.Tk):
 
     # ---------------- UI layout ----------------
     def build_ui(self):
-        # ---------------- YAML tab ----------------
+        # YAML tab layout
         self.editor_tab.grid_columnconfigure(0, weight=1)
         self.editor_tab.grid_rowconfigure(0, weight=0)
         self.editor_tab.grid_rowconfigure(1, weight=1, minsize=220)
@@ -463,18 +455,16 @@ class TaskipelagoApp(tk.Tk):
         tasks = ttk.LabelFrame(self.editor_tab, text="Tasks")
         tasks.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         tasks.grid_columnconfigure(0, weight=1)
-        tasks.grid_rowconfigure(0, weight=0, minsize =28)
+        tasks.grid_rowconfigure(0, weight=0, minsize=28)
         tasks.grid_rowconfigure(1, weight=1)
-        tasks.grid_rowconfigure(2, weight=0, minsize =44)
+        tasks.grid_rowconfigure(2, weight=0, minsize=44)
 
-        # Header row inside tasks box
         header = ttk.Frame(tasks)
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-
-        header.grid_columnconfigure(0, weight=0) # #
-        header.grid_columnconfigure(1, weight=3) # task
-        header.grid_columnconfigure(2, weight=3) # reward
-        header.grid_columnconfigure(3, weight=2) # prereqs
+        header.grid_columnconfigure(0, weight=0)
+        header.grid_columnconfigure(1, weight=3)
+        header.grid_columnconfigure(2, weight=3)
+        header.grid_columnconfigure(3, weight=2)
 
         ttk.Label(header, text="#").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(header, text="Task").grid(row=0, column=1, sticky="w")
@@ -504,9 +494,9 @@ class TaskipelagoApp(tk.Tk):
         bottom.grid_columnconfigure(0, weight=1)
         ttk.Button(bottom, text="Export YAML", command=self.export_yaml).grid(row=0, column=0, sticky="e")
 
-        self.add_task_row()  # start with one
+        self.add_task_row()
 
-        # ---------------- Play tab ----------------
+        # Play tab
         play_root = ttk.Frame(self.play_tab)
         play_root.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -675,14 +665,14 @@ class TaskipelagoApp(tk.Tk):
         self.after(0, self._clear_play_state)
 
     def _clear_play_state(self):
-        self.pending_locations = set()
+        self.pending_reward_locations = set()
         if getattr(self, "ctx", None):
             self.ctx.tasks = []
             self.ctx.rewards = []
             self.ctx.task_prereqs = []
             self.ctx.lock_prereqs = False
-            self.ctx.base_location_id = None
-            self.ctx.base_item_id = None
+            self.ctx.base_reward_location_id = None
+            self.ctx.base_complete_location_id = None
             self.ctx.death_link_pool = []
             self.ctx.death_link_enabled = False
             self.ctx.checked_locations_set = set()
@@ -706,8 +696,8 @@ class TaskipelagoApp(tk.Tk):
         if not getattr(self, "ctx", None):
             return
 
-        checked = getattr(self.ctx, "checked_locations_set", set())
-        self.pending_locations.difference_update(checked)
+        checked = getattr(self.ctx, "checked_locations_set", set()) or set()
+        self.pending_reward_locations.difference_update(checked)
 
         self._maybe_send_goal_complete()
         self.after(0, self.refresh_play_tab)
@@ -716,10 +706,13 @@ class TaskipelagoApp(tk.Tk):
         for child in self.play_tasks_scroll.inner.winfo_children():
             child.destroy()
 
-        if not getattr(self, "ctx", None) or not self.ctx.tasks or self.ctx.base_location_id is None:
+        if (
+            not getattr(self, "ctx", None)
+            or not self.ctx.tasks
+            or self.ctx.base_reward_location_id is None
+            or self.ctx.base_complete_location_id is None
+        ):
             return
-
-        self.total_task_count = len(self.ctx.tasks)
 
         panel = self.colors.get("panel", "#252526")
         border = self.colors.get("border", "#3a3a3a")
@@ -728,15 +721,17 @@ class TaskipelagoApp(tk.Tk):
 
         checked = set(getattr(self.ctx, "checked_locations_set", set()) or set())
 
-        # prereqs aligned list; if missing, treat as none
         prereq_list = list(getattr(self.ctx, "task_prereqs", []) or [])
         lock_prereqs = bool(getattr(self.ctx, "lock_prereqs", False))
 
         for i, task_name in enumerate(self.ctx.tasks):
-            loc_id = self.ctx.base_location_id + i
-            completed = (loc_id in checked) or (loc_id in self.pending_locations)
+            reward_loc_id = self.ctx.base_reward_location_id + i
+            complete_loc_id = self.ctx.base_complete_location_id + i
 
-            # Determine prereq completion
+            # Consider "completed" when reward location is checked (the one that sends items)
+            completed = (reward_loc_id in checked) or (reward_loc_id in self.pending_reward_locations)
+
+            # prereqs satisfied based on COMPLETE locations (completion tokens)
             prereq_ok = True
             prereq_text = ""
             if i < len(prereq_list) and prereq_list[i]:
@@ -749,10 +744,10 @@ class TaskipelagoApp(tk.Tk):
             top = tk.Frame(card, bg=panel)
             top.pack(fill="x", padx=10, pady=(8, 2))
 
-            display_text = task_name
+            display_text = f"{i+1}. {task_name}"
             task_color = fg
             if completed:
-                display_text = "✔ " + task_name
+                display_text = "✔ " + display_text
                 task_color = muted
 
             task_label = tk.Label(
@@ -768,12 +763,11 @@ class TaskipelagoApp(tk.Tk):
             task_label.pack(side="left", fill="x", expand=True)
 
             if not completed:
-                # if lock is on and prereqs not met, disable completion
                 can_complete = True
                 if lock_prereqs and not prereq_ok:
                     can_complete = False
 
-                btn = ttk.Button(top, text="Complete", command=lambda lid=loc_id: self.complete_task(lid))
+                btn = ttk.Button(top, text="Complete", command=lambda idx=i: self.complete_task(idx))
                 if not can_complete:
                     btn.state(["disabled"])
                 btn.pack(side="right", padx=(10, 0))
@@ -796,31 +790,45 @@ class TaskipelagoApp(tk.Tk):
 
     def _prereqs_satisfied(self, prereq_text: str, checked_locations: set) -> bool:
         """
-        prereq_text: "1,2,5" meaning tasks 1/2/5 must be checked first (1-based task numbering)
+        prereq_text: "1,2,5" meaning tasks 1/2/5 must be completed first.
+        Completion is represented by COMPLETE locations being checked.
         """
-        if not prereq_text or self.ctx.base_location_id is None:
+        if not prereq_text or self.ctx.base_complete_location_id is None:
             return True
         parts = [p.strip() for p in prereq_text.split(",") if p.strip()]
         for p in parts:
             try:
                 idx_1based = int(p)
             except ValueError:
-                # ignore junk tokens; you could choose to treat as invalid instead
                 continue
-            loc = self.ctx.base_location_id + (idx_1based - 1)
+            loc = self.ctx.base_complete_location_id + (idx_1based - 1)
             if loc not in checked_locations:
                 return False
         return True
 
-    def complete_task(self, location_id: int):
-        if location_id in self.pending_locations or location_id in getattr(self.ctx, "checked_locations_set", set()):
+    def complete_task(self, task_index: int):
+        if not getattr(self, "ctx", None):
+            return
+        if self.ctx.base_reward_location_id is None or self.ctx.base_complete_location_id is None:
             return
 
-        self.pending_locations.add(location_id)
+        reward_loc_id = self.ctx.base_reward_location_id + task_index
+        complete_loc_id = self.ctx.base_complete_location_id + task_index
+
+        checked = getattr(self.ctx, "checked_locations_set", set()) or set()
+        if reward_loc_id in checked or reward_loc_id in self.pending_reward_locations:
+            return
+
+        # UI optimism on reward location
+        self.pending_reward_locations.add(reward_loc_id)
         self.refresh_play_tab()
 
         async def _send():
-            await self.ctx.send_msgs([{"cmd": "LocationChecks", "locations": [location_id]}])
+            # IMPORTANT: send BOTH checks in one click
+            await self.ctx.send_msgs([{
+                "cmd": "LocationChecks",
+                "locations": [complete_loc_id, reward_loc_id]
+            }])
 
         self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
@@ -829,12 +837,13 @@ class TaskipelagoApp(tk.Tk):
             return
         if not getattr(self, "ctx", None):
             return
-        if not self.ctx.tasks or self.ctx.base_location_id is None:
+        if not self.ctx.tasks or self.ctx.base_reward_location_id is None:
             return
 
-        checked = getattr(self.ctx, "checked_locations_set", set())
+        checked = getattr(self.ctx, "checked_locations_set", set()) or set()
+
         for i in range(len(self.ctx.tasks)):
-            if (self.ctx.base_location_id + i) not in checked:
+            if (self.ctx.base_reward_location_id + i) not in checked:
                 return
 
         self.sent_goal = True
@@ -916,50 +925,71 @@ class TaskipelagoApp(tk.Tk):
 
     def _show_reward_popups(self, new_items):
         for it in new_items:
-                item_id = getattr(it, "item", None)
-                sender = getattr(it, "player", None)
-                loc = getattr(it, "location", None)
+            item_id = getattr(it, "item", None)
+            sender = getattr(it, "player", None)
+            loc = getattr(it, "location", None)
 
-                # 1) server-provided name map
-                name = None
-                try:
-                    item_names = getattr(self.ctx, "item_names", None)
-                    if isinstance(item_names, dict):
-                        name = item_names.get(item_id)
-                    elif hasattr(item_names, "get"):
-                        name = item_names.get(item_id)
-                except Exception:
-                    name = None
-
-                # 2) YAML reward text if one of our things
-                base = getattr(self.ctx, "base_item_id", None)
-                rewards = list(getattr(self.ctx, "rewards", []) or [])
-                if isinstance(base, int) and isinstance(item_id, int) and rewards:
-                    idx = item_id - base
-                    if 0 <= idx < len(rewards):
-                        # This is Taskipelago Reward {idx+1}
-                        name = rewards[idx]
-
-                # 3) Final fallback
-                if not name:
-                    name = f"Item ID {item_id}"
-
-                # dedupe the popup
-                key = (item_id, sender, loc)
-                now = time.time()
-                if key == self._last_reward_key and (now - self._last_reward_seen_at) < 1.5:
+            # ---- 1) HARD SKIP: Task Complete token items (912xxx range) ----
+            base_token = getattr(self.ctx, "base_token_id", None)
+            n_tasks = len(getattr(self.ctx, "tasks", []) or [])
+            if isinstance(base_token, int) and isinstance(item_id, int) and n_tasks:
+                if 0 <= (item_id - base_token) < n_tasks:
                     continue
-                self._last_reward_key = key
-                self._last_reward_seen_at = now
 
-                self._show_reward_popup(f"{name}\n\n(from player {sender})" if sender is not None else name)
+            # ---- 2) Resolve a REAL name (no fallback to "Item ID ...") ----
+            resolved_name = None
+
+            # 2a) Server-provided global item name map (best for multiworld items)
+            try:
+                item_names = getattr(self.ctx, "item_names", None)
+                if isinstance(item_names, dict):
+                    resolved_name = item_names.get(item_id)
+                elif hasattr(item_names, "get"):
+                    resolved_name = item_names.get(item_id)
+            except Exception:
+                resolved_name = None
+
+            # 2b) If this is one of our Taskipelago Reward items, show YAML reward text instead
+            base_reward_item = getattr(self.ctx, "base_item_id", None)
+            rewards_text = list(getattr(self.ctx, "rewards", []) or [])
+            if isinstance(base_reward_item, int) and isinstance(item_id, int) and rewards_text:
+                idx = item_id - base_reward_item
+                if 0 <= idx < len(rewards_text):
+                    resolved_name = rewards_text[idx]
+
+            # ---- 3) If we STILL don't have a name, do NOT popup ----
+            if not resolved_name or not str(resolved_name).strip():
+                continue
+
+            resolved_name = str(resolved_name).strip()
+
+            # If it's your filler token, don't popup
+            if resolved_name == RANDOM_TOKEN:
+                continue
+
+            # (Extra safety) If server name says Task Complete anyway, skip
+            if resolved_name.startswith("Task Complete "):
+                continue
+
+            # ---- dedupe the popup ----
+            key = (item_id, sender, loc)
+            now = time.time()
+            if key == self._last_reward_key and (now - self._last_reward_seen_at) < 1.5:
+                continue
+            self._last_reward_key = key
+            self._last_reward_seen_at = now
+
+            # show popup
+            self._show_reward_popup(
+                f"{resolved_name}\n\n(from player {sender})" if sender is not None else resolved_name
+            )
 
 
     def _show_reward_popup(self, reward_text: str):
         win = tk.Toplevel(self)
         win.title("Reward Received!")
         win.configure(bg=self.colors["bg"])
-        win.geometry("520x240")
+        win.geometry("520x260")
         win.transient(self)
         win.grab_set()
 
@@ -971,7 +1001,7 @@ class TaskipelagoApp(tk.Tk):
             text=reward_text,
             bg=self.colors["bg"],
             fg=self.colors["fg"],
-            font=("Segoe UI", 14),
+            font=("Segoe UI", 13),
             justify="center",
             wraplength=480
         )

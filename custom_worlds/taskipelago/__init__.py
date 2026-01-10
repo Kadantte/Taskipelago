@@ -5,16 +5,24 @@ from typing import Dict, List, Any
 from BaseClasses import Item, ItemClassification, Location, Region
 from worlds.AutoWorld import World, WebWorld
 from worlds.LauncherComponents import Component, Type, components, launch_subprocess
-from worlds.generic.Rules import set_rule
 
 from .options import TaskipelagoOptions
 
 print("Loading Taskipelago world module...")
 
-BASE_LOCATION_ID = 910_000          # REWARD locations (multiworld items)
-BASE_COMPLETE_LOC_ID = 913_000      # COMPLETION locations (logic tokens/events)
-BASE_ITEM_ID = 911_000              # Reward filler items
+# Reward locations: these contain real multiworld items and MUST be checked to send items.
+BASE_REWARD_LOC_ID = 910_000
+
+# Completion locations: these contain event items (tokens) for prereq logic.
+BASE_COMPLETE_LOC_ID = 920_000
+
+# Taskipelago contributes N reward items to keep item/location counts balanced.
+# (Those reward items will be placed somewhere in the multiworld.)
+BASE_ITEM_ID = 911_000
+BASE_TOKEN_ID = 912_000
+
 MAX_TASKS = 1000
+
 
 class TaskipelagoWeb(WebWorld):
     game = "Taskipelago"
@@ -33,16 +41,21 @@ class TaskipelagoWorld(World):
     web = TaskipelagoWeb()
     options_dataclass = TaskipelagoOptions
 
-    # These get populated during generate_early() for the current generation run.
+    # Stable ID maps for server/name resolution
     item_name_to_id: Dict[str, int] = {}
     location_name_to_id: Dict[str, int] = {}
 
-    # Pre-register a stable ID->name mapping so the server can resolve names and stuff.
+    # Pre-register stable IDs for max tasks
     location_name_to_id = {}
-    for i in range(1, MAX_TASKS + 1):
-        location_name_to_id[f"Task {i} (Reward)"] = BASE_LOCATION_ID + (i - 1)
-        location_name_to_id[f"Task {i} (Complete)"] = BASE_COMPLETE_LOC_ID + (i - 1)
-    item_name_to_id = {f"Reward {i}": BASE_ITEM_ID + (i - 1) for i in range(1, MAX_TASKS + 1)}
+    location_name_to_id.update({f"Task {i} (Reward)": BASE_REWARD_LOC_ID + (i - 1) for i in range(1, MAX_TASKS + 1)})
+    location_name_to_id.update({f"Task {i} (Complete)": BASE_COMPLETE_LOC_ID + (i - 1) for i in range(1, MAX_TASKS + 1)})
+
+    item_name_to_id.update(
+        {f"Reward {i}": int(BASE_ITEM_ID + (i - 1)) for i in range(1, MAX_TASKS + 1)}
+    )
+    item_name_to_id.update(
+        {f"Task Complete {i}": int(BASE_TOKEN_ID + (i - 1)) for i in range(1, MAX_TASKS + 1)}
+    )
 
     def generate_early(self) -> None:
         tasks = [str(t).strip() for t in self.options.tasks.value if str(t).strip()]
@@ -53,7 +66,7 @@ class TaskipelagoWorld(World):
         if len(tasks) != len(rewards):
             raise Exception(f"Taskipelago: tasks ({len(tasks)}) and rewards ({len(rewards)}) must be same length.")
 
-        # DeathLink pool validation
+        # DeathLink pool validation (only if death_link ends up enabled)
         if bool(self.options.death_link):
             dl_pool = [str(x).strip() for x in self.options.death_link_pool.value if str(x).strip()]
             if not dl_pool:
@@ -63,40 +76,42 @@ class TaskipelagoWorld(World):
         if n > MAX_TASKS:
             raise Exception(f"Taskipelago: too many tasks ({n}). Max supported is {MAX_TASKS}.")
 
-        # --- prereqs ---
+        # --- prereqs parse/normalize ---
         raw_prereqs = list(getattr(self.options, "task_prereqs").value or [])
-        # normalize length
         if len(raw_prereqs) < n:
             raw_prereqs += [""] * (n - len(raw_prereqs))
         raw_prereqs = raw_prereqs[:n]
         raw_prereqs = [str(x).strip() for x in raw_prereqs]
 
-        parsed_prereqs = []  # list[list[int]] each is list of 0-based indices
+        parsed_prereqs: List[List[int]] = []
         for i, txt in enumerate(raw_prereqs):
             if not txt:
                 parsed_prereqs.append([])
                 continue
             parts = [p.strip() for p in txt.split(",") if p.strip()]
-            reqs = []
+            reqs: List[int] = []
             for p in parts:
                 try:
                     idx_1 = int(p)
                 except ValueError:
-                    raise Exception(f"Taskipelago: invalid prereq '{p}' on task {i+1}. Use comma-separated integers like '1,2'.")
+                    raise Exception(
+                        f"Taskipelago: invalid prereq '{p}' on task {i+1}. "
+                        f"Use comma-separated integers like '1,2'."
+                    )
                 if idx_1 < 1 or idx_1 > n:
                     raise Exception(f"Taskipelago: prereq '{idx_1}' on task {i+1} is out of range (1..{n}).")
                 if idx_1 == (i + 1):
                     raise Exception(f"Taskipelago: task {i+1} cannot require itself.")
                 reqs.append(idx_1 - 1)
+
             # de-dupe while preserving order
             seen = set()
             reqs = [x for x in reqs if not (x in seen or seen.add(x))]
             parsed_prereqs.append(reqs)
 
-        # If lock_prereqs is ON, detect cycles (generator-visible logic must be acyclic)
         lock = bool(getattr(self.options, "lock_prereqs"))
         if lock:
-            # simple DFS cycle detect on task graph edges i -> prereq
+            # cycle detect in prereq graph
             visiting = set()
             visited = set()
 
@@ -121,70 +136,133 @@ class TaskipelagoWorld(World):
         self._parsed_prereqs = parsed_prereqs
         self._lock_prereqs = lock
 
-        # Stable names
-        self._location_names = [f"Task {i+1}" for i in range(n)]
+        # stable names for this generation
+        self._reward_location_names = [f"Task {i+1} (Reward)" for i in range(n)]
+        self._complete_location_names = [f"Task {i+1} (Complete)" for i in range(n)]
         self._reward_item_names = [f"Reward {i+1}" for i in range(n)]
+        self._token_item_names = [f"Task Complete {i+1}" for i in range(n)]
 
-        # ID maps for this generation
-        self.location_name_to_id = {name: BASE_LOCATION_ID + i for i, name in enumerate(self._location_names)}
-        # rewards (optional)
-        self.item_name_to_id = {name: BASE_ITEM_ID + i for i, name in enumerate(self._reward_item_names)}
+        # update id maps for this generation
+        self.location_name_to_id = {}
+        self.location_name_to_id.update(
+            {name: int(BASE_REWARD_LOC_ID + i) for i, name in enumerate(self._reward_location_names)}
+        )
+        self.location_name_to_id.update(
+            {name: int(BASE_COMPLETE_LOC_ID + i) for i, name in enumerate(self._complete_location_names)}
+        )
+
+        self.item_name_to_id = {f"Reward {i+1}": int(BASE_ITEM_ID + i) for i in range(n)}
+        self.item_name_to_id.update({f"Task Complete {i+1}": int(BASE_TOKEN_ID + i) for i in range(n)})
+
+        # Hard-sanitize IDs to real ints and validate
+        for name, lid in list(self.location_name_to_id.items()):
+            try:
+                self.location_name_to_id[name] = int(lid)
+            except Exception as e:
+                raise Exception(f"Taskipelago: location id for '{name}' is not an int: {lid!r} ({type(lid)})") from e
+            
+            # Hard-sanitize IDs to real ints and validate
+        for name, lid in list(self.item_name_to_id.items()):
+            try:
+                self.location_name_to_id[name] = int(lid)
+            except Exception as e:
+                raise Exception(f"Taskipelago: location id for '{name}' is not an int: {lid!r} ({type(lid)})") from e
+
 
     def create_regions(self) -> None:
         menu = Region("Menu", self.player, self.multiworld)
         tasks_region = Region("Tasks", self.player, self.multiworld)
 
-        for loc_name in self._location_names:
-            loc_id = self.location_name_to_id[loc_name]
-            tasks_region.locations.append(TaskipelagoLocation(self.player, loc_name, loc_id, tasks_region))
+        n = len(self._tasks)
+        for i in range(n):
+            rname = self._reward_location_names[i]
+            cname = self._complete_location_names[i]
+            rid = self.location_name_to_id.get(rname)
+            cid = self.location_name_to_id.get(cname)
+
+            if not isinstance(rid, int):
+                raise Exception(f"Bad reward location id: {rname} -> {rid!r} ({type(rid)})")
+            if not isinstance(cid, int):
+                raise Exception(f"Bad complete location id: {cname} -> {cid!r} ({type(cid)})")
+
+            tasks_region.locations.append(
+                TaskipelagoLocation(self.player, rname, rid, tasks_region)
+            )
+            tasks_region.locations.append(
+                TaskipelagoLocation(self.player, cname, cid, tasks_region)
+            )
+
+
 
         self.multiworld.regions += [menu, tasks_region]
         menu.connect(tasks_region)
 
     def create_items(self) -> None:
-        # Optional: reward items (these can still be sent around as filler if you want).
+        """
+        We add N reward items to keep world totals balanced:
+          - total locations: 2N (Reward + Complete)
+          - complete locations get N locked EVENT items (not in itempool)
+          - remaining items needed in itempool: N
+        These Reward {i} items will be distributed somewhere in the multiworld.
+        """
         for name in self._reward_item_names:
             self.multiworld.itempool.append(
-                TaskipelagoItem(name, ItemClassification.filler, self.item_name_to_id[name], self.player)
+                TaskipelagoItem(
+                    name,
+                    ItemClassification.filler,
+                    self.item_name_to_id[name],
+                    self.player,
+                )
             )
 
-        # REQUIRED for option 2: progression tokens (these will be locked to their own task locations)
-        # We do NOT put these in the itempool; we lock-place them in generate_basic().
-        # They still need stable IDs and to exist as Items.
+        # Completion tokens → progression, lock-placed later
         self._token_items = []
         for name in self._token_item_names:
             self._token_items.append(
-                TaskipelagoItem(name, ItemClassification.progression, self.item_name_to_id[name], self.player)
+                TaskipelagoItem(
+                    name,
+                    ItemClassification.progression,
+                    self.item_name_to_id[name],
+                    self.player,
+                )
             )
 
-
     def set_rules(self) -> None:
-        if not getattr(self, "_lock_prereqs", False):
+        if not self._lock_prereqs:
             return
 
-        # For each task location i, require owning completion tokens for its prereqs.
-        for i, loc_name in enumerate(self._location_names):
+        # Prereq logic locks the REWARD location behind completion EVENTs.
+        for i in range(len(self._tasks)):
             req_indices = self._parsed_prereqs[i]
             if not req_indices:
                 continue
 
-            required_token_names = [self._token_item_names[j] for j in req_indices]
-            location = self.multiworld.get_location(loc_name, self.player)
+            reward_loc = self.multiworld.get_location(self._reward_location_names[i], self.player)
+            required_token_names = tuple(f"Task Complete {j+1}" for j in req_indices)
 
-            def rule(state, req=tuple(required_token_names), player=self.player):
-                return all(state.has(token_name, player) for token_name in req)
+            def rule(state, req=required_token_names, player=self.player):
+                return all(state.has(name, player) for name in req)
 
-            location.access_rule = rule
+            reward_loc.access_rule = rule
 
     def generate_basic(self) -> None:
-        for i, loc_name in enumerate(self._location_names):
-            loc = self.multiworld.get_location(loc_name, self.player)
-            loc.place_locked_item(self._token_items[i])
+        # Place locked EVENT items on completion locations (code=None => not a network item id).
+        n = len(self._tasks)
+        for i in range(n):
+            complete_loc = self.multiworld.get_location(self._complete_location_names[i], self.player)
+            token_name = self._token_item_names[i]  # "Task Complete {i+1}"
+            token_item = TaskipelagoItem(
+                name=token_name,
+                classification=ItemClassification.progression,
+                code=self.item_name_to_id[token_name],  # integer
+                player=self.player
+            )
+            complete_loc.place_locked_item(token_item)
 
-        # Goal: all task locations checked (equivalent to owning all tokens)
-        my_locations = [self.multiworld.get_location(name, self.player) for name in self._location_names]
+        # Completion condition: all REWARD locations checked (meaning all multiworld items were triggered)
+        my_reward_locs = [self.multiworld.get_location(name, self.player) for name in self._reward_location_names]
         self.multiworld.completion_condition[self.player] = lambda state: all(
-            loc in state.locations_checked for loc in my_locations
+            loc in state.locations_checked for loc in my_reward_locs
         )
 
     def fill_slot_data(self) -> Dict[str, Any]:
@@ -193,19 +271,21 @@ class TaskipelagoWorld(World):
             "rewards": list(self._rewards),
 
             "task_prereqs": list(self._raw_prereqs),
-            "lock_prereqs": bool(getattr(self, "_lock_prereqs", False)),
+            "lock_prereqs": bool(self._lock_prereqs),
 
             "death_link_pool": [str(x).strip() for x in self.options.death_link_pool.value if str(x).strip()],
             "death_link_enabled": bool(self.options.death_link),
 
-            "base_location_id": BASE_LOCATION_ID,
-            "base_item_id": BASE_ITEM_ID,     # if you still use Reward {i}
-            "base_token_id": BASE_TOKEN_ID,   # NEW: if you ever want to resolve tokens client-side
+            "base_reward_location_id": BASE_REWARD_LOC_ID,
+            "base_complete_location_id": BASE_COMPLETE_LOC_ID,
+            "base_item_id": BASE_ITEM_ID,
         }
+
 
 def launch_client(*args):
     from .client import launch
     launch_subprocess(launch, name="TaskipelagoClient", args=args)
+
 
 components.append(
     Component(
