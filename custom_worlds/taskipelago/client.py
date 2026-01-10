@@ -289,6 +289,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.base_location_id = None
         self.death_link_pool = []
         self.death_link_enabled = False
+        self.checked_locations_set = set()
 
         # UI callback
         self.on_state_changed = None
@@ -305,25 +306,34 @@ class TaskipelagoContext(CommonClient.CommonContext):
             self.on_state_changed()
 
     def on_package(self, cmd: str, args: dict):
-        # Let base context do its normal bookkeeping
         super().on_package(cmd, args)
 
         if cmd == "Connected":
             self.apply_slot_data(args.get("slot_data", {}))
-            
-            async def _sync():
-                await self.send_msgs([{"cmd": "Sync"}])
 
-            asyncio.create_task(_sync())
+            # Populate checked locations immediately from Connected payload
+            self.checked_locations_set = set(args.get("checked_locations", []))
+
+            # Ask server to send full state again (safe even if redundant)
+            asyncio.create_task(self.send_msgs([{"cmd": "Sync"}]))
 
             if callable(self.on_state_changed):
                 self.on_state_changed()
             return
-        
-        # These packets are when your checked locations/items actually change
-        if cmd in ("RoomUpdate", "ReceivedItems"):
+
+        if cmd == "RoomUpdate":
+            # RoomUpdate is where checked locations usually refresh
+            if "checked_locations" in args:
+                self.checked_locations_set = set(args["checked_locations"])
+
             if callable(self.on_state_changed):
                 self.on_state_changed()
+            return
+
+        if cmd == "ReceivedItems":
+            if callable(self.on_state_changed):
+                self.on_state_changed()
+            return
 
 async def server_loop(ctx: TaskipelagoContext, address: str):
     import websockets  # lazy import
@@ -525,6 +535,17 @@ class TaskipelagoApp(tk.Tk):
         self._bind_mousewheel_to_widget(self.play_tasks_scroll.canvas, self.play_tasks_scroll)
         self._bind_mousewheel_to_widget(self.play_tasks_scroll.inner, self.play_tasks_scroll)
 
+    def _clear_play_state(self):
+        # clear local UI/client state
+        self.pending_locations = {} if isinstance(getattr(self, "pending_locations", {}), dict) else set()
+        if getattr(self, "ctx", None):
+            self.ctx.tasks = []
+            self.ctx.rewards = []
+            self.ctx.base_location_id = None
+            self.ctx.death_link_pool = []
+            self.ctx.death_link_enabled = False
+        self.refresh_play_tab()
+    
     def on_connect_toggle(self):
         if self.connection_state == "disconnected":
             self._start_connect()
@@ -622,12 +643,15 @@ class TaskipelagoApp(tk.Tk):
             self.connect_status.set("Connected.")
             self.connect_button.config(text="Disconnect")
 
-        # Remove any pending entries that have been confirmed by the server
-        checked = getattr(self.ctx, "locations_checked", set())
-        self.pending_locations = {lid for lid in self.pending_locations if lid not in checked}
+        if not getattr(self, "ctx", None):
+            return
 
-        # render
+        checked = getattr(self.ctx, "checked_locations_set", set())
+        if isinstance(getattr(self, "pending_locations", None), set):
+            self.pending_locations.difference_update(checked)
+
         self.after(0, self.refresh_play_tab)
+
 
     def refresh_play_tab(self):
         for child in self.play_tasks_scroll.inner.winfo_children():
@@ -643,7 +667,7 @@ class TaskipelagoApp(tk.Tk):
 
         for i, task_name in enumerate(self.ctx.tasks):
             loc_id = self.ctx.base_location_id + i
-            completed = (loc_id in getattr(self.ctx, "locations_checked", set())) or (loc_id in self.pending_locations)
+            completed = (loc_id in self.ctx.checked_locations_set) or (loc_id in self.pending_locations)
 
             # ---- Box container ----
             card = tk.Frame(
@@ -766,25 +790,38 @@ class TaskipelagoApp(tk.Tk):
                 lambda: asyncio.create_task(_do_disconnect())
             )
 
+        self.after(0, self._clear_play_state)
+
     def _reward_text_for_location(self, loc_id: int):
         for it in getattr(self.ctx, "items_received", []):
             if getattr(it, "location", None) == loc_id:
                 item_id = getattr(it, "item", None)
 
-                # Best-effort name resolution across AP versions
                 name = None
                 try:
-                    # CommonContext has item_names lookup sometimes
-                    if hasattr(self.ctx, "item_names") and isinstance(self.ctx.item_names, dict):
-                        name = self.ctx.item_names.get(item_id)
+                    name = Utils.get_item_name_from_id(item_id, self.ctx.game)
                 except Exception:
                     pass
+
+                if not name:
+                    # fallback: try ctx.item_names structures across versions
+                    try:
+                        obj = getattr(self.ctx, "item_names", None)
+                        if isinstance(obj, dict):
+                            name = obj.get(item_id)
+                        elif hasattr(obj, "get"):
+                            name = obj.get(item_id)
+                        elif hasattr(obj, "__getitem__"):
+                            name = obj[item_id]
+                    except Exception:
+                        name = None
 
                 if not name:
                     name = f"Item ID {item_id}"
 
                 return f"Unlocked: {name}"
         return None
+
     
     def _bind_mousewheel_to_widget(self, widget, scroll: ScrollableFrame):
         # Windows / macOS
