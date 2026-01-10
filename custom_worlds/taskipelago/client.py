@@ -916,36 +916,44 @@ class TaskipelagoApp(tk.Tk):
 
     def _show_reward_popups(self, new_items):
         for it in new_items:
-            item_id = getattr(it, "item", None)
-            sender = getattr(it, "player", None)
-            loc = getattr(it, "location", None)
+                item_id = getattr(it, "item", None)
+                sender = getattr(it, "player", None)
+                loc = getattr(it, "location", None)
 
-            # Resolve to YAML reward text if it's within our Taskipelago item range
-            name = getattr(it, "item_name", None)
-            if not name:
+                # 1) server-provided name map
+                name = None
                 try:
-                    name = Utils.get_item_name_from_id(item_id, self.ctx.game)
+                    item_names = getattr(self.ctx, "item_names", None)
+                    if isinstance(item_names, dict):
+                        name = item_names.get(item_id)
+                    elif hasattr(item_names, "get"):
+                        name = item_names.get(item_id)
                 except Exception:
                     name = None
 
-            if not name:
+                # 2) YAML reward text if one of our things
                 base = getattr(self.ctx, "base_item_id", None)
-                rewards = getattr(self.ctx, "rewards", []) or []
-                resolved = None
-                if isinstance(base, int) and isinstance(item_id, int):
+                rewards = list(getattr(self.ctx, "rewards", []) or [])
+                if isinstance(base, int) and isinstance(item_id, int) and rewards:
                     idx = item_id - base
                     if 0 <= idx < len(rewards):
-                        resolved = rewards[idx]
-                name = resolved or f"Item ID {item_id}"
+                        # This is Taskipelago Reward {idx+1}
+                        name = rewards[idx]
 
-            key = (item_id, sender, loc)
-            now = time.time()
-            if key == self._last_reward_key and (now - self._last_reward_seen_at) < 1.5:
-                continue
-            self._last_reward_key = key
-            self._last_reward_seen_at = now
+                # 3) Final fallback
+                if not name:
+                    name = f"Item ID {item_id}"
 
-            self._show_reward_popup(name)
+                # dedupe the popup
+                key = (item_id, sender, loc)
+                now = time.time()
+                if key == self._last_reward_key and (now - self._last_reward_seen_at) < 1.5:
+                    continue
+                self._last_reward_key = key
+                self._last_reward_seen_at = now
+
+                self._show_reward_popup(f"{name}\n\n(from player {sender})" if sender is not None else name)
+
 
     def _show_reward_popup(self, reward_text: str):
         win = tk.Toplevel(self)
