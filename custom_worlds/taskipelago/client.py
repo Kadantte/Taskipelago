@@ -169,8 +169,9 @@ class ScrollableFrame(ttk.Frame):
 # Rows (YAML Generator)
 # ----------------------------
 class TaskRow:
-    def __init__(self, parent, filler_token: str, on_remove):
+    def __init__(self, parent, index: int, filler_token: str, on_remove):
         self.frame = ttk.Frame(parent)
+        self.index = index
         self.filler_token = filler_token
         self._on_remove = on_remove
 
@@ -180,23 +181,26 @@ class TaskRow:
         self.filler_var = tk.BooleanVar()
 
         self._saved_reward = ""
+        
+        self.num_label = ttk.Label(self.frame, text=str(index), width=3)
+        self.num_label.grid(row=0, column=0, padx=(0, 8), sticky ="w")
 
-        ttk.Entry(self.frame, textvariable=self.task_var).grid(row=0, column=0, padx=(0, 8), sticky="ew")
-        ttk.Entry(self.frame, textvariable=self.reward_var).grid(row=0, column=1, padx=(0, 8), sticky="ew")
-        ttk.Entry(self.frame, textvariable=self.prereq_var).grid(row=0, column=2, padx=(0, 8), sticky="ew")
+        ttk.Entry(self.frame, textvariable=self.task_var).grid(row=0, column=1, padx=(0, 8), sticky="ew")
+        ttk.Entry(self.frame, textvariable=self.reward_var).grid(row=0, column=2, padx=(0, 8), sticky="ew")
+        ttk.Entry(self.frame, textvariable=self.prereq_var).grid(row=0, column=3, padx=(0, 8), sticky="ew")
 
         ttk.Checkbutton(
             self.frame,
             text="Filler",
             variable=self.filler_var,
             command=self.on_filler_toggle,
-        ).grid(row=0, column=3, padx=(0, 8), sticky="w")
+        ).grid(row=0, column=4, padx=(0, 8), sticky="w")
 
-        ttk.Button(self.frame, text="Remove", width=8, command=self.remove).grid(row=0, column=4, sticky="e")
+        ttk.Button(self.frame, text="Remove", width=8, command=self.remove).grid(row=0, column=5, sticky="e")
 
-        self.frame.grid_columnconfigure(0, weight=3)
         self.frame.grid_columnconfigure(1, weight=3)
-        self.frame.grid_columnconfigure(2, weight=2)
+        self.frame.grid_columnconfigure(2, weight=3)
+        self.frame.grid_columnconfigure(3, weight=2)
 
     def remove(self):
         self.frame.destroy()
@@ -466,13 +470,16 @@ class TaskipelagoApp(tk.Tk):
         # Header row inside tasks box
         header = ttk.Frame(tasks)
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        header.grid_columnconfigure(0, weight=3)
-        header.grid_columnconfigure(1, weight=3)
-        header.grid_columnconfigure(2, weight=2)
 
-        ttk.Label(header, text="Task").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="Reward / Challenge").grid(row=0, column=1, sticky="w")
-        ttk.Label(header, text="Prereqs (1-based, e.g. 1,2)").grid(row=0, column=2, sticky="w")
+        header.grid_columnconfigure(0, weight=0) # #
+        header.grid_columnconfigure(1, weight=3) # task
+        header.grid_columnconfigure(2, weight=3) # reward
+        header.grid_columnconfigure(3, weight=2) # prereqs
+
+        ttk.Label(header, text="#").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(header, text="Task").grid(row=0, column=1, sticky="w")
+        ttk.Label(header, text="Reward / Challenge").grid(row=0, column=2, sticky="w")
+        ttk.Label(header, text="Prereqs (1-based, e.g. 1,2)").grid(row=0, column=3, sticky="w")
 
         self.tasks_scroll = ScrollableFrame(tasks, colors=self.colors)
         self.tasks_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
@@ -485,7 +492,7 @@ class TaskipelagoApp(tk.Tk):
         dl.grid(row=2, column=0, sticky="nsew")
         dl.grid_columnconfigure(0, weight=1)
         dl.grid_rowconfigure(0, weight=1)
-        dl.grid_rowconfigure(1, weight=0)
+        dl.grid_rowconfigure(1, weight=0, minsize=44)
 
         self.dl_scroll = ScrollableFrame(dl, colors=self.colors)
         self.dl_scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
@@ -535,13 +542,16 @@ class TaskipelagoApp(tk.Tk):
 
     # ---------------- YAML generator actions ----------------
     def add_task_row(self):
-        row = TaskRow(self.tasks_scroll.inner, RANDOM_TOKEN, self._remove_task_row)
+        row = TaskRow(self.tasks_scroll.inner, len(self.task_rows) + 1, RANDOM_TOKEN, self._remove_task_row)
         row.frame.pack(fill="x", pady=4)
         self.task_rows.append(row)
 
     def _remove_task_row(self, row):
         if row in self.task_rows:
             self.task_rows.remove(row)
+        for i, r in enumerate(self.task_rows, start=1):
+            r.index = i
+            r.num_label.config(text=str(i))
 
     def add_deathlink_row(self):
         row = DeathLinkRow(self.dl_scroll.inner, self._remove_deathlink_row)
