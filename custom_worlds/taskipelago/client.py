@@ -669,6 +669,9 @@ class TaskipelagoApp(tk.Tk):
             lambda: asyncio.create_task(_send())
         )
 
+        # an optimistic refresh
+        self.after(200, self.refresh_play_tab)
+
 
     def _start_connect(self):
         if self.connection_state != "disconnected":
