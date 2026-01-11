@@ -75,8 +75,6 @@ def apply_dark_theme(root: tk.Tk):
 # Scrollable container (auto-hide scrollbar)
 # ----------------------------
 class ScrollableFrame(ttk.Frame):
-    _active_scroll = None
-
     def __init__(self, parent, colors=None):
         super().__init__(parent)
         self.colors = colors or {"bg": "#1e1e1e"}
@@ -84,6 +82,10 @@ class ScrollableFrame(ttk.Frame):
         self.canvas = tk.Canvas(self, highlightthickness=0, bg=self.colors["bg"])
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
+
+        # Mark ownership so we can find the right ScrollableFrame from any child widget
+        self.canvas._scroll_owner = self
+        self.inner._scroll_owner = self
 
         self.window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=self._on_scroll)
@@ -97,12 +99,6 @@ class ScrollableFrame(ttk.Frame):
 
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-
-        for w in (self.canvas, self.inner):
-            w.bind("<Enter>", lambda _e, self=self: self._set_active(True))
-            w.bind("<Leave>", lambda _e, self=self: self._set_active(False))
-            w.bind("<Button-4>", lambda e, self=self: self._on_mousewheel_linux(-1))
-            w.bind("<Button-5>", lambda e, self=self: self._on_mousewheel_linux(1))
 
     def _on_scroll(self, first, last):
         self.vsb.set(first, last)
@@ -131,29 +127,40 @@ class ScrollableFrame(ttk.Frame):
         else:
             self.vsb.grid_remove()
 
-    def _set_active(self, active: bool):
-        if active:
-            ScrollableFrame._active_scroll = self
-        elif ScrollableFrame._active_scroll is self:
-            ScrollableFrame._active_scroll = None
-
+    # ---------- Mousewheel plumbing ----------
     @classmethod
     def bind_mousewheel_to_root(cls, root: tk.Misc):
-        root.bind_all("<MouseWheel>", cls._dispatch_mousewheel, add=True)
+        # Windows/macOS
+        root.bind_all("<MouseWheel>", lambda e, r=root: cls._dispatch_mousewheel(e, r), add=True)
+        # Linux
+        root.bind_all("<Button-4>", lambda e, r=root: cls._dispatch_mousewheel_linux(e, r, -1), add=True)
+        root.bind_all("<Button-5>", lambda e, r=root: cls._dispatch_mousewheel_linux(e, r, 1), add=True)
 
     @classmethod
-    def _dispatch_mousewheel(cls, event):
-        if cls._active_scroll is None:
+    def _find_scroll_owner_under_pointer(cls, root: tk.Misc, x_root: int, y_root: int):
+        w = root.winfo_containing(x_root, y_root)
+        while w is not None:
+            if hasattr(w, "_scroll_owner"):
+                return getattr(w, "_scroll_owner")
+            w = getattr(w, "master", None)
+        return None
+
+    @classmethod
+    def _dispatch_mousewheel(cls, event, root: tk.Misc):
+        owner = cls._find_scroll_owner_under_pointer(root, event.x_root, event.y_root)
+        if owner is None:
             return
-        cls._active_scroll._on_mousewheel(event)
 
-    def _on_mousewheel(self, event):
-        delta = int(-1 * (event.delta / 120)) if event.delta else 0
+        delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else 0
         if delta:
-            self.canvas.yview_scroll(delta, "units")
+            owner.canvas.yview_scroll(delta, "units")
 
-    def _on_mousewheel_linux(self, direction: int):
-        self.canvas.yview_scroll(direction, "units")
+    @classmethod
+    def _dispatch_mousewheel_linux(cls, event, root: tk.Misc, direction: int):
+        owner = cls._find_scroll_owner_under_pointer(root, event.x_root, event.y_root)
+        if owner is None:
+            return
+        owner.canvas.yview_scroll(direction, "units")
 
 
 # ----------------------------
@@ -217,20 +224,29 @@ class TaskRow:
 
 
 class DeathLinkRow:
-    def __init__(self, parent, on_remove):
-        self.frame = ttk.Frame(parent)
-        self.text_var = tk.StringVar()
-        self.weight_var = tk.StringVar(value="1")
+    def __init__(self, parent, index: int, on_remove):
+        self.parent = parent
+        self.index = index
         self._on_remove = on_remove
 
-        ttk.Entry(self.frame, textvariable=self.text_var).grid(row=0, column=0, padx=(0, 8), sticky="ew")
-        ttk.Entry(self.frame, textvariable=self.weight_var, width=6).grid(row=0, column=1, padx=(0, 8), sticky="w")
-        ttk.Button(self.frame, text="Remove", width=8, command=self.remove).grid(row=0, column=2)
+        self.text_var = tk.StringVar()
+        self.weight_var = tk.StringVar(value="1")
 
-        self.frame.grid_columnconfigure(0, weight=1)
+        self.task_entry = ttk.Entry(parent, textvariable=self.text_var)
+        self.weight_entry = ttk.Entry(parent, textvariable=self.weight_var, width=6)
+        self.remove_btn = ttk.Button(parent, text="Remove", width=8, command=self.remove)
+
+        self._grid()
+
+    def _grid(self):
+        r = self.index  # header is row 0
+        self.task_entry.grid(row=r, column=0, padx=(0, 8), pady=4, sticky="ew")
+        self.weight_entry.grid(row=r, column=1, padx=(0, 8), pady=4, sticky="w")
+        self.remove_btn.grid(row=r, column=2, pady=4, sticky="e")
 
     def remove(self):
-        self.frame.destroy()
+        for w in (self.task_entry, self.weight_entry, self.remove_btn):
+            w.destroy()
         self._on_remove(self)
 
     def get_data(self):
@@ -502,6 +518,15 @@ class TaskipelagoApp(tk.Tk):
         self.dl_scroll = ScrollableFrame(dl, colors=self.colors)
         self.dl_scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
+        dl_tbl = self.dl_scroll.inner
+        dl_tbl.grid_columnconfigure(0, weight=1)  # task text expands
+        dl_tbl.grid_columnconfigure(1, weight=0)  # weight fixed
+        dl_tbl.grid_columnconfigure(2, weight=0)  # remove fixed
+
+        ttk.Label(dl_tbl, text="DeathLink Task").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        # Label can extend over Remove column per your request
+        ttk.Label(dl_tbl, text="Weight").grid(row=0, column=1, columnspan=2, sticky="w")
+
         ttk.Button(dl, text="Add DeathLink Task", command=self.add_deathlink_row).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
 
         bottom = ttk.Frame(self.editor_tab)
@@ -561,13 +586,17 @@ class TaskipelagoApp(tk.Tk):
             r._grid()  # re-place widgets on the correct grid row
 
     def add_deathlink_row(self):
-        row = DeathLinkRow(self.dl_scroll.inner, self._remove_deathlink_row)
-        row.frame.pack(fill="x", pady=4)
+        # rows start at 1 because header is row 0
+        row = DeathLinkRow(self.dl_scroll.inner, len(self.deathlink_rows) + 1, self._remove_deathlink_row)
         self.deathlink_rows.append(row)
 
     def _remove_deathlink_row(self, row):
         if row in self.deathlink_rows:
             self.deathlink_rows.remove(row)
+
+        for i, r in enumerate(self.deathlink_rows, start=1):
+            r.index = i
+            r._grid()
 
     def export_yaml(self):
         player_name = self.player_name_var.get().strip()

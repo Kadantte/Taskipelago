@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List
 
-from Options import PerGameCommonOptions, DeathLink, OptionList, Toggle
+from Options import PerGameCommonOptions, DeathLink, OptionList, Toggle, Range
 
 class Tasks(OptionList):
     display_name = "Tasks"
