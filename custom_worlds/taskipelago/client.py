@@ -1,5 +1,4 @@
 import asyncio
-import os
 from pathlib import Path
 import random
 import threading
@@ -295,7 +294,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self._last_item_index = 0
 
         # persist received notification state
-        self._notify_state_path = Path(os.path.expanduser("~")) / ".taskipelago" / "notify_state.json"
+        self._notify_state_path = Path.cwd() / "notify_state.json"
         self._notify_key = None
         self._loaded_notify_index = False
         self._pending_notify_index = None  # type: int | None
@@ -376,7 +375,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
                 # Persist baseline so a crash right after connect doesn't replay history next time.
                 self.save_last_notified_index(self._last_item_index)
 
-            if len(items) > self._last_item_index:
+            if len(items) >= self._last_item_index:
                 new_items = items[self._last_item_index:]
                 self._last_item_index = len(items)
 
