@@ -939,10 +939,10 @@ class TaskipelagoApp(tk.Tk):
         # amnesty- ignores X deathlinks
         amnesty = int(getattr(self.ctx, "death_link_amnesty", 0) or 0) if getattr(self, "ctx", None) else 0
 
-        if self._deathlink_amnesty_left > amnesty:
+        if self._deathlink_amnesty_left > 0:
             self._deathlink_amnesty_left -= 1
             return # iframed through it babyyy let's go
-        
+
         self._deathlink_amnesty_left = amnesty # reset if not dodged
 
         pool = list(getattr(self.ctx, "death_link_pool", []) or [])
