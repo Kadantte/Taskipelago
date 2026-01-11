@@ -353,10 +353,17 @@ class TaskipelagoContext(CommonClient.CommonContext):
                     self.on_item_received(new_items)
 
     async def enable_deathlink_tag(self):
+        # If we aren't connected to a server endpoint yet, bail.
+        if not getattr(self, "server", None):
+            return
+
+        # Always try at least once per connection; guard only prevents spamming.
         if self._deathlink_tag_enabled:
             return
+
         self._deathlink_tag_enabled = True
         await self.send_msgs([{"cmd": "ConnectUpdate", "tags": ["DeathLink"]}])
+
 
 
 async def server_loop(ctx: TaskipelagoContext, address: str):
@@ -367,6 +374,9 @@ async def server_loop(ctx: TaskipelagoContext, address: str):
     try:
         socket = await websockets.connect(address, ping_timeout=None, ping_interval=None)
         ctx.server = Endpoint(socket)
+
+        # ensure every connection will send deathlink tag over
+        ctx._deathlink_tag_enabled = False
 
         await ctx.send_connect()
 
@@ -720,6 +730,10 @@ class TaskipelagoApp(tk.Tk):
 
             self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_do_disconnect()))
 
+        if getattr(self, "ctx", None):
+            self.ctx.server = None
+            self.ctx._deathlink_tag_enabled = False
+
         self.after(0, self._clear_play_state)
 
     def _clear_play_state(self):
@@ -733,8 +747,10 @@ class TaskipelagoApp(tk.Tk):
             self.ctx.base_complete_location_id = None
             self.ctx.death_link_pool = []
             self.ctx.death_link_enabled = False
+            self.ctx.deathlink_tag_enabled = False
             self.ctx.checked_locations_set = set()
             self.ctx._last_item_index = 0
+            self._deathlink_amnesty_left = 0
             if hasattr(self.ctx, "locations_checked"):
                 self.ctx.locations_checked = set()
         self.refresh_play_tab()
