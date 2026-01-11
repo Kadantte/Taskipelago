@@ -9,4 +9,3 @@ take that Jira.
 * Import options from yaml
 * Incoming message pane rather than ugly evil pop-up windows
 * Store which rewards have already been received in the past so you don't get spammed when reconnecting
-* Bug with not getting death links after disconnect & reconnect
