@@ -177,7 +177,8 @@ class TaskRow:
         self.num_label.grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         ttk.Entry(self.frame, textvariable=self.task_var).grid(row=0, column=1, padx=(0, 8), sticky="ew")
-        ttk.Entry(self.frame, textvariable=self.reward_var).grid(row=0, column=2, padx=(0, 8), sticky="ew")
+        self.reward_entry = ttk.Entry(self.frame, textvariable=self.reward_var)
+        self.reward_entry.grid(row=0, column=2, padx=(0, 8), sticky="ew")
         ttk.Entry(self.frame, textvariable=self.prereq_var).grid(row=0, column=3, padx=(0, 8), sticky="ew")
 
         ttk.Checkbutton(
@@ -202,8 +203,11 @@ class TaskRow:
             current = self.reward_var.get().strip()
             if current and current != self.filler_token:
                 self._saved_reward = current
+
             self.reward_var.set(self.filler_token)
+            self.reward_entry.state(["disabled"])   # lock editing
         else:
+            self.reward_entry.state(["!disabled"])  # unlock editing
             self.reward_var.set(self._saved_reward)
 
     def get_data(self):
@@ -459,17 +463,21 @@ class TaskipelagoApp(tk.Tk):
         tasks.grid_rowconfigure(1, weight=1)
         tasks.grid_rowconfigure(2, weight=0, minsize=44)
 
+        # header for top section
         header = ttk.Frame(tasks)
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        header.grid_columnconfigure(0, weight=0)
-        header.grid_columnconfigure(1, weight=3)
-        header.grid_columnconfigure(2, weight=3)
-        header.grid_columnconfigure(3, weight=2)
+
+        header.grid_columnconfigure(0, weight=0) # #
+        header.grid_columnconfigure(1, weight=3) # task
+        header.grid_columnconfigure(2, weight=3) # reward
+        header.grid_columnconfigure(3, weight=2) # prereqs
+        header.grid_columnconfigure(4, weight=0) # filler
+        header.grid_columnconfigure(5, weight=0) # remove
 
         ttk.Label(header, text="#").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(header, text="Task").grid(row=0, column=1, sticky="w")
-        ttk.Label(header, text="Reward / Challenge").grid(row=0, column=2, sticky="w")
-        ttk.Label(header, text="Prereqs (1-based, e.g. 1,2)").grid(row=0, column=3, sticky="w")
+        ttk.Label(header, text="Task").grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(header, text="Reward / Challenge").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Label(header, text="Prereqs (1-based, e.g. 1,2)").grid(row=0, column=3, sticky="w", padx=(0, 8))
 
         self.tasks_scroll = ScrollableFrame(tasks, colors=self.colors)
         self.tasks_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
