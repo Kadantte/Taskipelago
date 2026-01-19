@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import random
 import threading
@@ -358,32 +360,51 @@ class TaskipelagoContext(CommonClient.CommonContext):
                     self.on_deathlink(data)
 
         if cmd == "ReceivedItems":
-            items = list(getattr(self, "items_received", []) or [])
+            # Archipelago sends deltas as: {"index": <start>, "items": [ ... ]}
+            try:
+                packet_index = int(args.get("index", 0) or 0)
+            except Exception:
+                packet_index = 0
 
-            # If this is the first ReceivedItems after connect, establish baseline.
+            packet_items = list(args.get("items") or [])
+            packet_end = packet_index + len(packet_items)
+
+            # First ReceivedItems after connect: establish baseline using absolute server index.
             if not self._loaded_notify_index:
                 self._loaded_notify_index = True
 
                 if isinstance(self._pending_notify_index, int):
-                    # We've notified up through this index in the past; resume from there.
-                    self._last_item_index = min(self._pending_notify_index, len(items))
+                    # Resume from previously-notified absolute index
+                    self._last_item_index = max(0, int(self._pending_notify_index))
                 else:
-                    # First time on this machine: treat existing history as already-seen,
-                    # so we only popup for future rewards.
-                    self._last_item_index = len(items)
+                    # First time on this machine: skip ALL history by setting baseline to end of this packet.
+                    self._last_item_index = packet_end
 
-                # Persist baseline so a crash right after connect doesn't replay history next time.
+                # Persist immediately so reconnect/crash doesn't replay history
                 self.save_last_notified_index(self._last_item_index)
 
-            if len(items) >= self._last_item_index:
-                new_items = items[self._last_item_index:]
-                self._last_item_index = len(items)
+            # Detect server restart
+            if packet_end < self._last_item_index:
+                # reset local cursor to the start of this packet so we process it
+                self._last_item_index = packet_index
+                self.save_last_notified_index(self._last_item_index, force=True)
 
-                # Persist that we've now notified through this index.
-                self.save_last_notified_index(self._last_item_index)
+            # If this packet ends at/before what we've already shown, nothing new
+            if packet_end <= self._last_item_index:
+                return
 
-                if callable(self.on_item_received):
-                    self.on_item_received(new_items)
+            # Compute overlap: how many items in this packet have we already notified?
+            # If _last_item_index is inside this packet range, skip up to that point.
+            already_notified_in_packet = max(0, self._last_item_index - packet_index)
+
+            new_items = packet_items[already_notified_in_packet:]
+
+            # Advance last notified absolute index to end of packet
+            self._last_item_index = packet_end
+            self.save_last_notified_index(self._last_item_index)
+
+            if callable(self.on_item_received) and new_items:
+                self.on_item_received(new_items)
 
 
     async def enable_deathlink_tag(self):
@@ -402,7 +423,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         # Slot name is stored in ctx.auth by your connect flow
         server = (self.server_address or "").strip().lower()
         slot = (getattr(self, "auth", None) or "").strip()
-        return f"{server}::{slot}"
+        return f"v2::{server}::{slot}"
 
     def _load_notify_state(self) -> dict:
         try:
@@ -430,18 +451,21 @@ class TaskipelagoContext(CommonClient.CommonContext):
             return val
         return None
 
-    def save_last_notified_index(self, idx: int) -> None:
+    def save_last_notified_index(self, idx: int, *, force: bool = False) -> None:
         if idx is None:
             return
         if self._notify_key is None:
             self._notify_key = self._make_notify_key()
         if not self._notify_key.strip(":"):
             return
+
         data = self._load_notify_state()
         prev = data.get(self._notify_key)
-        # Only move forward
-        if isinstance(prev, int) and prev > idx:
+
+        # Only move forward unless forced (used for server reset)
+        if not force and isinstance(prev, int) and prev > idx:
             return
+
         data[self._notify_key] = int(idx)
         self._save_notify_state(data)
 
@@ -532,6 +556,12 @@ async def server_loop(ctx: TaskipelagoContext, address: str):
         if hasattr(ctx, "on_disconnected") and callable(ctx.on_disconnected):
             ctx.on_disconnected()
 
+@dataclass
+class Notification:
+    kind: str # "reward" | "deathlink"
+    title: str
+    body: str
+    created_at: float # time.time()
 
 # ----------------------------
 # Main app
@@ -561,6 +591,10 @@ class TaskipelagoApp(tk.Tk):
         # YAML generator state
         self.task_rows = []
         self.deathlink_rows = []
+
+        # Notifications state
+        self._notifications: list[Notification] = []
+        self._max_notifications = 200  # keep memory bounded
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
@@ -693,8 +727,14 @@ class TaskipelagoApp(tk.Tk):
         play_root = ttk.Frame(self.play_tab)
         play_root.pack(fill="both", expand=True, padx=10, pady=10)
 
+        # Split: left main + right notifications
+        play_root.grid_columnconfigure(0, weight=3)
+        play_root.grid_columnconfigure(1, weight=1)
+        play_root.grid_rowconfigure(2, weight=1) # tasks row grows
+
         conn_frame = ttk.LabelFrame(play_root, text="Connection")
-        conn_frame.pack(fill="x", pady=(0, 10))
+        conn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=(0, 10))
+        # conn_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(conn_frame, text="Server (host:port):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.server_var = tk.StringVar(value="localhost:38281")
@@ -715,13 +755,28 @@ class TaskipelagoApp(tk.Tk):
         self.connect_button.pack(side="left")
 
         self.connect_status = tk.StringVar(value="Not connected.")
-        ttk.Label(play_root, textvariable=self.connect_status).pack(anchor="w")
+        # ttk.Label(play_root, textvariable=self.connect_status).pack(anchor="w")
+        ttk.Label(play_root, textvariable=self.connect_status).grid(row=1, column=0, sticky="w", padx=(0, 10))
 
         tasks_frame = ttk.LabelFrame(play_root, text="Tasks")
-        tasks_frame.pack(fill="both", expand=True, pady=(10, 0))
+        tasks_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 10), pady=(10, 0))
 
         self.play_tasks_scroll = ScrollableFrame(tasks_frame, colors=self.colors)
         self.play_tasks_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # ---- Notifications panel ----
+        notif_frame = ttk.LabelFrame(play_root, text="Notifications")
+        notif_frame.grid(row=0, column=1, rowspan=3, sticky="nsew")
+        notif_frame.grid_rowconfigure(1, weight=1)
+        notif_frame.grid_columnconfigure(0, weight=1)
+
+        notif_btns = ttk.Frame(notif_frame)
+        notif_btns.grid(row=0, column=0, sticky="ew", padx=10, pady=(0, 0))
+        ttk.Button(notif_btns, text="Clear", command=self._clear_notifications).pack(side="left")
+
+        self.notif_scroll = ScrollableFrame(notif_frame, colors=self.colors)
+        self.notif_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
 
     # ---------------- YAML generator actions ----------------
     def add_task_row(self):
@@ -1071,6 +1126,61 @@ class TaskipelagoApp(tk.Tk):
                 self.ctx.locations_checked = set()
         self.refresh_play_tab()
 
+    # ---------------- Notifications stuff ----------------
+    def _clear_notifications(self):
+        self._notifications.clear()
+        self._render_notifications()
+
+    def _enqueue_notification(self, n: Notification):
+        self._notifications.append(n)
+        if len(self._notifications) > self._max_notifications:
+            self._notifications = self._notifications[-self._max_notifications:]
+        self._render_notifications()
+
+    def _dismiss_notification(self, idx: int):
+        if 0 <= idx < len(self._notifications):
+            self._notifications.pop(idx)
+            self._render_notifications()
+
+    def _render_notifications(self):
+        if not hasattr(self, "notif_scroll"):
+            return
+
+        inner = self.notif_scroll.inner
+        for child in inner.winfo_children():
+            child.destroy()
+
+        panel = self.colors.get("panel", "#252526")
+        border = self.colors.get("border", "#3a3a3a")
+        fg = self.colors.get("fg", "#e6e6e6")
+        muted = self.colors.get("muted", "#bdbdbd")
+
+        for i, n in enumerate(reversed(self._notifications)):
+            # reversed so newest on top
+            real_idx = len(self._notifications) - 1 - i
+
+            card = tk.Frame(inner, bg=panel, highlightbackground=border, highlightthickness=1)
+            card.pack(fill="x", pady=6, padx=2)
+
+            top = tk.Frame(card, bg=panel)
+            top.pack(fill="x", padx=8, pady=(8, 2))
+
+            title = tk.Label(top, text=n.title, bg=panel, fg=fg, font=("Segoe UI", 11, "bold"),
+                             anchor="w", justify="left", wraplength=260)
+            title.pack(side="left", fill="x", expand=True)
+
+            ttk.Button(top, text="Dismiss", command=lambda ix=real_idx: self._dismiss_notification(ix)).pack(side="right")
+
+            ts = datetime.fromtimestamp(n.created_at).strftime("%H:%M:%S")
+            meta = tk.Label(card, text=f"{n.kind.upper()} • {ts}", bg=panel, fg=muted,
+                            font=("Segoe UI", 9), anchor="w")
+            meta.pack(fill="x", padx=8)
+
+            body = tk.Label(card, text=n.body, bg=panel, fg=fg, font=("Segoe UI", 10),
+                            anchor="w", justify="left", wraplength=300)
+            body.pack(fill="x", padx=8, pady=(4, 8))
+        
+
     # ---------------- Async loop plumbing ----------------
     def _run_async_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -1304,43 +1414,16 @@ class TaskipelagoApp(tk.Tk):
         source = data.get("source") or "Unknown"
         cause = data.get("cause") or ""
 
-        win = tk.Toplevel(self)
-        win.title("DEATHLINK!")
-        win.configure(bg=self.colors["bg"])
-        win.geometry("520x260")
-        win.transient(self)
-        win.grab_set()
-
-        title = tk.Label(win, text="DEATHLINK!", bg=self.colors["bg"], fg="#ff6b6b", font=("Segoe UI", 20, "bold"))
-        title.pack(pady=(18, 10))
-
         detail_text = f"From: {source}"
         if cause:
             detail_text += f"\n{cause}"
 
-        details = tk.Label(
-            win,
-            text=detail_text,
-            bg=self.colors["bg"],
-            fg=self.colors["muted"],
-            font=("Segoe UI", 10),
-            justify="center",
-            wraplength=480
-        )
-        details.pack(pady=(0, 10))
-
-        task_label = tk.Label(
-            win,
-            text=task,
-            bg=self.colors["bg"],
-            fg=self.colors["fg"],
-            font=("Segoe UI", 14),
-            justify="center",
-            wraplength=480
-        )
-        task_label.pack(pady=(0, 18))
-
-        ttk.Button(win, text="Dismiss", command=win.destroy).pack()
+        self._enqueue_notification(Notification(
+            kind="deathlink",
+            title="DEATHLINK!",
+            body=f"{detail_text}\n\nTask: {task}",
+            created_at=time.time()
+        ))
 
     # ---------------- Reward popup ----------------
     def on_items_received(self, new_items):
@@ -1351,6 +1434,16 @@ class TaskipelagoApp(tk.Tk):
             item_id = getattr(it, "item", None)
             sender = getattr(it, "player", None)
             loc = getattr(it, "location", None)
+
+            # If we can't even read an item id, enqueue a debug notification
+            if item_id is None:
+                self._enqueue_notification(Notification(
+                    kind="reward",
+                    title="Reward Received (unparsed)",
+                    body=f"Got a reward event but couldn't parse fields:\n{it!r}",
+                    created_at=time.time()
+                ))
+                continue
 
             # ---- 1) HARD SKIP: Task Complete token items (912xxx range) ----
             base_token = getattr(self.ctx, "base_token_id", None)
@@ -1403,34 +1496,37 @@ class TaskipelagoApp(tk.Tk):
             self._last_reward_seen_at = now
 
             # show popup
-            self._show_reward_popup(
-                f"{resolved_name}\n\n(from player {sender})" if sender is not None else resolved_name
-            )
+            self._enqueue_notification(Notification(
+                kind="reward",
+                title="Reward Received!",
+                body=(f"{resolved_name}\n\n(from player {sender})" if sender is not None else resolved_name),
+                created_at=time.time()
+            ))
 
+    # Unused as of now, used to show rewards as a separate pop-up, but moved that into the sidebar.
+    # def _show_reward_popup(self, reward_text: str):
+    #     win = tk.Toplevel(self)
+    #     win.title("Reward Received!")
+    #     win.configure(bg=self.colors["bg"])
+    #     win.geometry("520x260")
+    #     win.transient(self)
+    #     win.grab_set()
 
-    def _show_reward_popup(self, reward_text: str):
-        win = tk.Toplevel(self)
-        win.title("Reward Received!")
-        win.configure(bg=self.colors["bg"])
-        win.geometry("520x260")
-        win.transient(self)
-        win.grab_set()
+    #     title = tk.Label(win, text="REWARD RECEIVED!", bg=self.colors["bg"], fg="#4ade80", font=("Segoe UI", 20, "bold"))
+    #     title.pack(pady=(18, 12))
 
-        title = tk.Label(win, text="REWARD RECEIVED!", bg=self.colors["bg"], fg="#4ade80", font=("Segoe UI", 20, "bold"))
-        title.pack(pady=(18, 12))
+    #     body = tk.Label(
+    #         win,
+    #         text=reward_text,
+    #         bg=self.colors["bg"],
+    #         fg=self.colors["fg"],
+    #         font=("Segoe UI", 13),
+    #         justify="center",
+    #         wraplength=480
+    #     )
+    #     body.pack(pady=(0, 18))
 
-        body = tk.Label(
-            win,
-            text=reward_text,
-            bg=self.colors["bg"],
-            fg=self.colors["fg"],
-            font=("Segoe UI", 13),
-            justify="center",
-            wraplength=480
-        )
-        body.pack(pady=(0, 18))
-
-        ttk.Button(win, text="Nice", command=win.destroy).pack()
+    #     ttk.Button(win, text="Nice", command=win.destroy).pack()
 
 
 if __name__ == "__main__":
