@@ -6,8 +6,10 @@ take that Jira.
 
 
 * Fix the reward thingy to show an actual player name rather than "player #"
-* Add a scrolling pane of incoming rewards and death links rather than evil pop-ups
 * fix it reloading every time you complete a task
 * optimize, it is very laggy when lots of tasks.
 * make it store the last server and slot that was connected to and auto-fill that info
 * add a reset button to yaml generator
+* add notification for what item was sent out when completing a task for ease of use
+* add proper text console window (separate tab?)
+* notification history
