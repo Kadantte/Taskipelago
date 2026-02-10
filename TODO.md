@@ -13,3 +13,5 @@ take that Jira.
 * add notification for what item was sent out when completing a task for ease of use
 * add proper text console window (separate tab?)
 * notification history
+* prerequisite rewards for tasks (i.e. "Progressive Broom" lol)
+* mark rewards as traps, junk, useful, progression
