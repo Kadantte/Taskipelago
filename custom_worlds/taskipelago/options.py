@@ -13,6 +13,16 @@ class Rewards(OptionList):
     default: List[str] = []
 
 
+class RewardTypes(OptionList):
+    """
+    Parallel list aligned with rewards/tasks. Each entry  is one of:
+        "trap" | "junk" | "useful" | "progression"
+    Missing/invalid entries will be treated as "junk".
+    """
+    display_name = "Reward Types"
+    default: List[str] = []
+
+
 class TaskPrereqs(OptionList):
     """
     List to show task preqreqs, entries formatted:
@@ -55,6 +65,7 @@ class TaskipelagoOptions(PerGameCommonOptions):
     death_link: DeathLink
     tasks: Tasks
     rewards: Rewards
+    reward_types: RewardTypes
     task_prereqs: TaskPrereqs
     lock_prereqs: LockPreqreqs
     death_link_pool: DeathLinkPool

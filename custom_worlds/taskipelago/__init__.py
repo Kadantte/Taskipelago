@@ -61,10 +61,25 @@ class TaskipelagoWorld(World):
         tasks = [str(t).strip() for t in self.options.tasks.value if str(t).strip()]
         rewards = [str(r).strip() for r in self.options.rewards.value if str(r).strip()]
 
+        reward_types_raw = list(getattr(self.options, "reward_types", None).value) if hasattr(self.options,  "reward_types") else []
+        reward_types = [str(x).strip().lower() for x in reward_types_raw if str(x).strip()]
+
         if not tasks:
             raise Exception("Taskipelago: tasks list is empty.")
         if len(tasks) != len(rewards):
             raise Exception(f"Taskipelago: tasks ({len(tasks)}) and rewards ({len(rewards)}) must be same length.")
+        
+        # Normalize reward_types to tasks length; default "junk"
+        if len(reward_types) < len(tasks):
+            reward_types += ["junk"] * (len(tasks) - len(reward_types))
+        reward_types = reward_types[:len(tasks)]
+
+        allowed = {"trap", "junk", "useful", "progression"}
+        reward_types = [rt if rt in allowed else "junk" for rt in reward_types]
+
+        self._tasks = tasks
+        self._rewards = rewards
+        self._reward_types = reward_types
 
         # DeathLink pool validation (only if death_link ends up enabled)
         if bool(self.options.death_link):
@@ -236,11 +251,29 @@ class TaskipelagoWorld(World):
           - remaining items needed in itempool: N
         These Reward {i} items will be distributed somewhere in the multiworld.
         """
-        for name in self._reward_item_names:
+        # Reward items: classification comes from reward_types
+        for i, name in enumerate(self._reward_item_names):
+            rt = "junk"
+            try:
+                if hasattr(self, "_reward_types") and i < len(self._reward_types):
+                    rt = (self._reward_types[i] or "junk").lower()
+            except Exception:
+                rt = "junk"
+
+            cls = ItemClassification.filler
+            if rt == "trap":
+                cls = ItemClassification.trap
+            elif rt == "useful":
+                cls = ItemClassification.useful
+            elif rt == "progression":
+                cls = ItemClassification.progression
+            else:
+                cls = ItemClassification.filler  # junk -> filler
+
             self.multiworld.itempool.append(
                 TaskipelagoItem(
                     name,
-                    ItemClassification.filler,
+                    cls,
                     self.item_name_to_id[name],
                     self.player,
                 )
@@ -300,6 +333,7 @@ class TaskipelagoWorld(World):
         return {
             "tasks": list(self._tasks),
             "rewards": list(self._rewards),
+            "reward_types": list(getattr(self, "_reward_types", [])),
 
             "task_prereqs": list(self._raw_prereqs),
             "lock_prereqs": bool(self._lock_prereqs),

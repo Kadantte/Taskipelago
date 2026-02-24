@@ -16,7 +16,8 @@ import CommonClient
 from NetUtils import Endpoint, decode
 
 FILLER_TOKEN = "nothing here, get pranked nerd"
-
+REWARD_TYPE_VALUES = ("junk", "useful", "progression", "trap")
+DEFAULT_REWARD_TYPE = "useful"
 
 # ----------------------------
 # Dark theme helpers (ttk)
@@ -182,6 +183,16 @@ class TaskRow:
         self.prereq_var = tk.StringVar()
         self.filler_var = tk.BooleanVar()
 
+        self.reward_type_var = tk.StringVar(value=DEFAULT_REWARD_TYPE)
+        self._saved_reward_type = DEFAULT_REWARD_TYPE
+        self.reward_type_cb = ttk.Combobox(
+            parent,
+            textvariable=self.reward_type_var,
+            values=REWARD_TYPE_VALUES,
+            state="readonly",
+            width=12
+        )
+
         self._saved_reward = ""
 
         self.num_label = ttk.Label(parent, text=str(index), width=3)
@@ -199,11 +210,14 @@ class TaskRow:
         self.task_entry.grid(row=r, column=1, padx=(0, 8), sticky="ew", pady=4)
         self.reward_entry.grid(row=r, column=2, padx=(0, 8), sticky="ew", pady=4)
         self.prereq_entry.grid(row=r, column=3, padx=(0, 8), sticky="ew", pady=4)
-        self.filler_cb.grid(row=r, column=4, padx=(0, 8), sticky="w", pady=4)
-        self.remove_btn.grid(row=r, column=5, sticky="e", pady=4)
+
+        self.reward_type_cb.grid(row=r, column=4, padx=(0, 8), sticky="w", pady=4)
+
+        self.filler_cb.grid(row=r, column=5, padx=(0, 8), sticky="w", pady=4)
+        self.remove_btn.grid(row=r, column=6, sticky="e", pady=4)
 
     def remove(self):
-        for w in (self.num_label, self.task_entry, self.reward_entry, self.prereq_entry, self.filler_cb, self.remove_btn):
+        for w in (self.num_label, self.task_entry, self.reward_entry, self.prereq_entry, self.reward_type_cb, self.filler_cb, self.remove_btn):
             w.destroy()
         self._on_remove(self)
 
@@ -212,18 +226,30 @@ class TaskRow:
             current = self.reward_var.get().strip()
             if current and current != self.filler_token:
                 self._saved_reward = current
+
+            current_type = self.reward_type_var.get().strip().lower()
+            if current_type:
+                self._saved_reward_type = current_type
+
             self.reward_var.set(self.filler_token)
             self.reward_entry.state(["disabled"])
+
+            self.reward_type_var.set("junk")
+            self.reward_type_cb.state(["disabled"])
         else:
             self.reward_entry.state(["!disabled"])
             self.reward_var.set(self._saved_reward)
+
+            self.reward_type_cb.state(["!disabled"])
+            self.reward_type_var.set(self._saved_reward_type or "useful")
 
     def get_data(self):
         return (
             self.task_var.get().strip(),
             self.reward_var.get().strip(),
             self.prereq_var.get().strip(),
-            self.filler_var.get()
+            self.filler_var.get(),
+            self.reward_type_var.get().strip().lower() or "useful",
         )
 
 
@@ -683,15 +709,16 @@ class TaskipelagoApp(tk.Tk):
 
         tbl = self.tasks_scroll.inner
 
-        for col, weight in [(1, 3), (2, 3), (3, 2)]:
+        for col, weight in [(1, 3), (2, 3), (3, 2), (4, 1)]:
             tbl.grid_columnconfigure(col, weight=weight)
 
         ttk.Label(tbl, text="#").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(tbl, text="Task").grid(row=0, column=1, sticky="w", padx=(0, 8))
         ttk.Label(tbl, text="Reward / Challenge").grid(row=0, column=2, sticky="w", padx=(0, 8))
         ttk.Label(tbl, text="Prereqs (1-based, e.g. 1,2)").grid(row=0, column=3, sticky="w", padx=(0, 8))
-        ttk.Label(tbl, text="").grid(row=0, column=4, sticky="w")  # filler column placeholder
-        ttk.Label(tbl, text="").grid(row=0, column=5, sticky="w")  # remove column placeholder
+        ttk.Label(tbl, text="Type").grid(row=0, column=4, sticky="w", padx=(0, 8))
+        ttk.Label(tbl, text="").grid(row=0, column=5, sticky="w")  # filler column placeholder
+        ttk.Label(tbl, text="").grid(row=0, column=6, sticky="w")  # remove column placeholder
 
         btn_row = ttk.Frame(tasks)
         btn_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -866,17 +893,21 @@ class TaskipelagoApp(tk.Tk):
             messagebox.showerror("Error", "Player name is required.")
             return
 
-        tasks, rewards, prereqs = [], [], []
+        tasks, rewards, prereqs, reward_types = [], [], [], []
         for r in self.task_rows:
-            t, rw, pr, filler = r.get_data()
+            t, rw, pr, filler, rtype = r.get_data()
             if not t:
                 continue
             if not rw:
                 messagebox.showerror("Error", "Each task must have a reward or be marked Filler.")
                 return
+
             tasks.append(t)
             rewards.append(FILLER_TOKEN if filler else rw)
             prereqs.append(pr or "")
+
+            # filler is always junk
+            reward_types.append("junk" if filler else (rtype or "junk"))
 
         if not tasks:
             messagebox.showerror("Error", "No tasks defined.")
@@ -916,6 +947,7 @@ class TaskipelagoApp(tk.Tk):
 
                 "tasks": tasks,
                 "rewards": rewards,
+                "reward_types": reward_types,
                 "task_prereqs": prereqs,
                 "lock_prereqs": bool(self.lock_prereqs_var.get()),
 
@@ -996,12 +1028,14 @@ class TaskipelagoApp(tk.Tk):
         tasks = list(block.get("tasks", []) or [])
         rewards = list(block.get("rewards", []) or [])
         prereqs = list(block.get("task_prereqs", []) or [])
+        reward_types = list(block.get("reward_types", []) or [])
 
         # Normalize lengths
         n = max(len(tasks), len(rewards), len(prereqs))
         tasks += [""] * (n - len(tasks))
         rewards += [""] * (n - len(rewards))
         prereqs += [""] * (n - len(prereqs))
+        reward_types += ["useful"] * (n - len(reward_types))
 
         # Wipe existing UI rows then rebuild
         self._clear_task_rows()
@@ -1010,6 +1044,7 @@ class TaskipelagoApp(tk.Tk):
             t = str(tasks[i]).strip() if tasks[i] is not None else ""
             rw = str(rewards[i]).strip() if rewards[i] is not None else ""
             pr = str(prereqs[i]).strip() if prereqs[i] is not None else ""
+            rt = str(reward_types[i]).strip().lower() if reward_types[i] is not None else "useful"
 
             # Skip completely empty rows
             if not t and not rw and not pr:
@@ -1030,6 +1065,12 @@ class TaskipelagoApp(tk.Tk):
                 row.filler_var.set(False)
                 row.reward_entry.state(["!disabled"])
                 row.reward_var.set(rw)
+
+            # reward types handling
+            if rt not in ("trap", "junk", "useful", "progression"):
+                rt = "useful"
+            row.reward_type_var.set(rt)
+            row._saved_reward_type = rt
 
         # Ensure at least 1 row exists for UX
         if not self.task_rows:
@@ -1713,7 +1754,7 @@ class TaskipelagoApp(tk.Tk):
             ))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__"
     TaskipelagoApp().mainloop()
 
 
