@@ -718,8 +718,15 @@ class TaskipelagoApp(tk.Tk):
         bottom = ttk.Frame(self.editor_tab)
         bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
-        ttk.Button(bottom, text="Import YAML", command=self.import_yaml).grid(row=0, column=0, sticky="e", padx=(10, 0))
-        ttk.Button(bottom, text="Export YAML", command=self.export_yaml).grid(row=0, column=1, sticky="e", padx=(0, 10))
+        ttk.Button(bottom, text="Reset", command=self.reset_yaml_generator).grid(
+            row=0, column=0, sticky="w", padx=(10, 0)
+        )
+        ttk.Button(bottom, text="Import YAML", command=self.import_yaml).grid(
+            row=0, column=1, sticky="e", padx=(0, 6)
+        )
+        ttk.Button(bottom, text="Export YAML", command=self.export_yaml).grid(
+            row=0, column=2, sticky="e", padx=(0, 10)
+        )
 
         self.add_task_row()
 
@@ -1052,6 +1059,20 @@ class TaskipelagoApp(tk.Tk):
             row.weight_var.set(wtxt)
 
         messagebox.showinfo("Imported", f"Imported YAML from:\n{path}")
+
+    def reset_yaml_generator(self):
+        # reset to defaults
+        self.player_name_var.set("")
+        self.progression_var.set(50)
+        self.accessibility_var.set("full")
+        self.deathlink_enabled.set(True)
+        self.deathlink_amnesty_var.set(0)
+        self.lock_prereqs_var.set(False)
+
+        # clear rows and recreate initial blank task row
+        self._clear_task_rows()
+        self._clear_deathlink_rows()
+        self.add_task_row()
 
     # ---------------- Connection actions ----------------
     def on_connect_toggle(self):
@@ -1534,7 +1555,7 @@ class TaskipelagoApp(tk.Tk):
                 body=(f"{resolved_name}\n\n(from player {sender_label})" if sender is not None else resolved_name),
                 created_at=time.time()
             ))
-            
+
     # Unused as of now, used to show rewards as a separate pop-up, but moved that into the sidebar.
     # def _show_reward_popup(self, reward_text: str):
     #     win = tk.Toplevel(self)
