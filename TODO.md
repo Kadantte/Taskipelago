@@ -6,12 +6,12 @@ take that Jira.
 
 
 * Fix the reward thingy to show an actual player name rather than "player #"
-* fix it reloading every time you complete a task
-* optimize, it is very laggy when lots of tasks.
-* make it store the last server and slot that was connected to and auto-fill that info
-* add a reset button to yaml generator
-* add notification for what item was sent out when completing a task for ease of use
-* add proper text console window (separate tab?)
-* notification history
-* prerequisite rewards for tasks (i.e. "Progressive Broom" lol)
-* mark rewards as traps, junk, useful, progression
+* Fix it reloading every time you complete a task
+* Optimize, it can be quite laggy when lots of tasks.
+* Store the last server and slot that was connected to and auto-fill that info
+* Add reset button to yaml generator
+* Add notification for what item was sent out when completing a task
+* Add proper archipelago text console window (separate tab?)
+* Notification history
+* Prerequisite rewards for tasks rather than just prerequisite tasks (separate column with a field the same as the pre-requisite tasks, and a checkbox to enable/disable this feature)
+* Dropdown list to mark a reward as trap, junk, useful, progression, ensuring the apworld itself picks up on this. 
