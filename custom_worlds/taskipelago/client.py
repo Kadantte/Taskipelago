@@ -322,7 +322,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self._last_item_index = 0
 
         # persist received notification state
-        self._notify_state_path = Path.cwd() / "notify_state.json"
+        self._notify_state_path = Path.cwd() / "taskipelago_notify_state.json"
         self._notify_key = None
         self._loaded_notify_index = False
         self._pending_notify_index = None  # type: int | None
@@ -772,12 +772,16 @@ class TaskipelagoApp(tk.Tk):
         conn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=(0, 10))
         # conn_frame.pack(fill="x", pady=(0, 10))
 
+        last = self._load_last_connection()
+        server_default = str(last.get("server") or "archipelago.gg")
+        slot_default = str(last.get("slot") or "")
+
         ttk.Label(conn_frame, text="Server (host:port):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.server_var = tk.StringVar(value="localhost:38281")
+        self.server_var = tk.StringVar(value=server_default)
         ttk.Entry(conn_frame, textvariable=self.server_var, width=30).grid(row=0, column=1, padx=5)
 
         ttk.Label(conn_frame, text="Slot Name:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.slot_var = tk.StringVar()
+        self.slot_var = tk.StringVar(value=slot_default)
         ttk.Entry(conn_frame, textvariable=self.slot_var, width=30).grid(row=1, column=1, padx=5)
 
         ttk.Label(conn_frame, text="Password:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
@@ -1137,6 +1141,9 @@ class TaskipelagoApp(tk.Tk):
         if not server or not slot:
             messagebox.showerror("Error", "Server and Slot Name are required.")
             return
+        
+        # store last connection to restore next load
+        self._save_last_connection(server, slot)
 
         self.connection_state = "connecting"
         self.connect_status.set(f"Connecting to {server} as {slot}...")
@@ -1244,6 +1251,27 @@ class TaskipelagoApp(tk.Tk):
                             anchor="w", justify="left", wraplength=300)
             body.pack(fill="x", padx=8, pady=(4, 8))
         
+    def _last_connection_path(self) -> Path:
+        # keep it alongside other per-user state
+        return Path.cwd() / "taskipelago_last_connection.json"
+
+    def _load_last_connection(self) -> dict:
+        try:
+            p = self._last_connection_path()
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8") or "{}") or {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_last_connection(self, server: str, slot: str) -> None:
+        try:
+            p = self._last_connection_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"server": server, "slot": slot}, indent=2), encoding="utf-8")
+        except Exception:
+            # don't crash the client for a persistence failure
+            pass
 
     # ---------------- Async loop plumbing ----------------
     def _run_async_loop(self):
