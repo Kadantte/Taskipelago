@@ -10,3 +10,7 @@ take that Jira.
 * Notification history
 * tasklock integration to force all task locks to be in the taskipelago world (generate tasklock yaml with plando logic included, warn user to enable plando items in host.yaml)
 * Designate a "Goal" task
+* Lots of cleaning & make it follow apworld standards better
+* Region-based logic with percentage completion to unlock next region
+* Fix display bug on sent notification
+* Add in seed to hash in stored data
