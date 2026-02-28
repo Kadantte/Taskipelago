@@ -14,3 +14,4 @@ take that Jira.
 * Region-based logic with percentage completion to unlock next region
 * Fix display bug on sent notification
 * Add in seed to hash in stored data
+* Fix yaml gen "remove button" bug
