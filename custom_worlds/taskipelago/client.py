@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+import urllib.request
 from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
@@ -1317,6 +1318,73 @@ class Notification:
     created_at: float # time.time()
 
 # ----------------------------
+# Community YAML library (public Google Drive folder)
+# ----------------------------
+COMMUNITY_YAML_FOLDER_ID = "1-zjxfR_OHQD4OgOISBVcO6GXEZtm3-B7gUGFvkkLVSokfjBb7xtKvgoQrSk-sBrE1ycFzLgA"
+
+# The public folder's embedded view is a lightweight HTML page (no JS execution needed),
+# unlike the full Drive UI which is a JS SPA.
+_DRIVE_FILE_LINK_RE = re.compile(
+    r'<a href="https://drive\.google\.com/file/d/([-\w]{15,})/view[^"]*"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _drive_ssl_context():
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _parse_community_yaml_filename(filename: str):
+    """Return (slot, author, version) for SLOTNAME_AUTHORNAME_VERSION-WITH-DASHES.yaml, else None."""
+    lower = filename.lower()
+    if lower.endswith(".yaml"):
+        base = filename[:-5]
+    elif lower.endswith(".yml"):
+        base = filename[:-4]
+    else:
+        return None
+    parts = base.split("_")
+    if len(parts) != 3:
+        return None
+    slot, author, version_dashed = (p.strip() for p in parts)
+    if not slot or not author or not version_dashed:
+        return None
+    return slot, author, version_dashed.replace("-", ".")
+
+
+def _fetch_community_yaml_entries():
+    """Poll the public community-YAML Drive folder for compliant filenames. Raises on network failure."""
+    url = "https://drive.google.com/embeddedfolderview?id=" + COMMUNITY_YAML_FOLDER_ID
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15, context=_drive_ssl_context()) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    entries = []
+    for file_id, inner in _DRIVE_FILE_LINK_RE.findall(html):
+        filename = _HTML_TAG_RE.sub("", inner).strip()
+        parsed = _parse_community_yaml_filename(filename)
+        if parsed is None:
+            continue
+        slot, author, version = parsed
+        entries.append({
+            "file_id": file_id,
+            "filename": filename,
+            "slot": slot,
+            "author": author,
+            "version": version,
+        })
+    entries.sort(key=lambda e: (e["slot"].lower(), e["author"].lower()))
+    return entries
+
+
+def _download_community_yaml_text(file_id: str) -> str:
+    url = "https://drive.google.com/uc?export=download&id=" + file_id
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15, context=_drive_ssl_context()) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+# ----------------------------
 # Main app
 # ----------------------------
 class TaskipelagoApp(tk.Tk):
@@ -1415,6 +1483,7 @@ class TaskipelagoApp(tk.Tk):
         name_strip = ttk.Frame(self.editor_tab)
         name_strip.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
         ttk.Button(name_strip, text="Tutorial", command=self._open_tutorial).pack(side="right")
+        ttk.Button(name_strip, text="Community YAMLs", command=self._open_community_yamls).pack(side="right", padx=(0, 8))
         ttk.Label(name_strip, text="Player Name:").pack(side="left", padx=(0, 6))
         self.player_name_var = tk.StringVar()
         _limit_var_length(self.player_name_var, MAX_PLAYER_NAME_LEN)
@@ -2748,6 +2817,10 @@ class TaskipelagoApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to read YAML:\n{e}")
             return
 
+        if self._populate_from_taskipelago_doc(doc):
+            messagebox.showinfo("Imported", f"Imported YAML from:\n{path}")
+
+    def _populate_from_taskipelago_doc(self, doc) -> bool:
         player_name, block = self._extract_taskipelago_block(doc)
         if not isinstance(block, dict):
             messagebox.showerror(
@@ -2757,7 +2830,7 @@ class TaskipelagoApp(tk.Tk):
                 "  - root: { name: ..., Taskipelago: {...} }\n"
                 "  - or a player entry: { <player>: { Taskipelago: {...} } }"
             )
-            return
+            return False
 
         # --------- Populate global settings ---------
         if player_name:
@@ -3054,7 +3127,86 @@ class TaskipelagoApp(tk.Tk):
             row.weight_var.set(wtxt)
 
         self._update_item_counter()
-        messagebox.showinfo("Imported", f"Imported YAML from:\n{path}")
+        return True
+
+    def _open_community_yamls(self):
+        win = tk.Toplevel(self)
+        win.title("Community YAMLs")
+        win.resizable(False, False)
+        win.grab_set()
+
+        status_var = tk.StringVar(value="Loading community YAML list...")
+        ttk.Label(win, textvariable=status_var).pack(padx=16, pady=16)
+
+        def on_loaded(entries=None, error=None):
+            for w in win.winfo_children():
+                w.destroy()
+
+            if error is not None:
+                ttk.Label(win, text=f"Failed to load community YAML list:\n{error}").pack(padx=16, pady=16)
+                ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+                return
+
+            if not entries:
+                ttk.Label(win, text="No community YAMLs found.").pack(padx=16, pady=16)
+                ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+                return
+
+            table = ttk.Frame(win)
+            table.pack(padx=16, pady=12)
+
+            header_font = ("TkDefaultFont", 9, "bold")
+            ttk.Label(table, text="Slot Name", font=header_font).grid(row=0, column=0, sticky="w", padx=(0, 20))
+            ttk.Label(table, text="Author", font=header_font).grid(row=0, column=1, sticky="w", padx=(0, 20))
+            ttk.Label(table, text="Taskipelago Version", font=header_font).grid(row=0, column=2, sticky="e", padx=(0, 20))
+
+            for i, entry in enumerate(entries, start=1):
+                ttk.Label(table, text=entry["slot"]).grid(row=i, column=0, sticky="w", padx=(0, 20), pady=2)
+                ttk.Label(table, text=entry["author"]).grid(row=i, column=1, sticky="w", padx=(0, 20), pady=2)
+                ttk.Label(table, text=entry["version"]).grid(row=i, column=2, sticky="e", padx=(0, 20), pady=2)
+                ttk.Button(
+                    table, text="Import YAML",
+                    command=lambda e=entry: self._import_community_yaml(win, e)
+                ).grid(row=i, column=3, sticky="e", pady=2)
+
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+
+        def worker():
+            try:
+                entries = _fetch_community_yaml_entries()
+            except Exception as e:
+                self.after(0, lambda: on_loaded(error=e))
+                return
+            self.after(0, lambda: on_loaded(entries=entries))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_community_yaml(self, list_win, entry):
+        status_win = tk.Toplevel(self)
+        status_win.title("Importing...")
+        status_win.resizable(False, False)
+        status_win.grab_set()
+        ttk.Label(status_win, text=f"Downloading {entry['filename']}...").pack(padx=16, pady=16)
+
+        def finish(doc=None, error=None):
+            status_win.destroy()
+            if error is not None:
+                messagebox.showerror("Error", f"Failed to import community YAML:\n{error}")
+                return
+            if self._populate_from_taskipelago_doc(doc):
+                list_win.destroy()
+                messagebox.showinfo("Imported", f"Imported YAML from community file:\n{entry['filename']}")
+
+        def worker():
+            try:
+                text = _download_community_yaml_text(entry["file_id"])
+                doc = yaml.safe_load(text)
+            except Exception as e:
+                self.after(0, lambda: finish(error=e))
+                return
+            self.after(0, lambda: finish(doc=doc))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reset_yaml_generator(self):
         self.player_name_var.set("")

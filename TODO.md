@@ -4,8 +4,8 @@ what are you gonna do about it?
 take that Jira.
 
 ## Next major release features
-* Region requirements
-* Submission box and presets for community made yamls
+* ~~Submission box and presets for community made yamls~~
+* ~~Region requirements~~
 * ~~Visible/hidden task rewards and scout/hint all yaml option~~
 * ~~Facelift/make purchaseables distinct~~
 * ~~Task description text~~
@@ -14,7 +14,6 @@ take that Jira.
 * ~~priority tasks~~
 
 ### High Prio:
-* Multi-completion tasks
 * Pomodoro-sanity
 
 ### Medium Prio:
@@ -22,3 +21,4 @@ take that Jira.
 
 ### Low Prio:
 * Tasklock integration to force all task locks to be in the taskipelago world (generate tasklock yaml with plando logic included, warn user to enable plando items in host.yaml)
+* Multi-completion tasks
