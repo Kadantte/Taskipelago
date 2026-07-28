@@ -14,6 +14,7 @@ take that Jira.
 * ~~priority tasks~~
 
 ### High Prio:
+* Linux testing/bug fix (color picker is broken)
 * Pomodoro-sanity
 
 ### Medium Prio:
