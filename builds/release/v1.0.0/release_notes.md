@@ -4,6 +4,7 @@
 ## New Features
 * Description text can be attached to tasks
 * Added a YAML option to preview task rewards via scouting or hinting
+* Community YAML Library accessible in YAML Generator
 
 ## Changes
 * Added dollar signs to the purchase button to make it more distinctive
