@@ -3133,6 +3133,7 @@ class TaskipelagoApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Community YAMLs")
         win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         win.grab_set()
 
         status_var = tk.StringVar(value="Loading community YAML list...")
@@ -3185,6 +3186,7 @@ class TaskipelagoApp(tk.Tk):
         status_win = tk.Toplevel(self)
         status_win.title("Importing...")
         status_win.resizable(False, False)
+        status_win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         status_win.grab_set()
         ttk.Label(status_win, text=f"Downloading {entry['filename']}...").pack(padx=16, pady=16)
 
@@ -3534,6 +3536,7 @@ class TaskipelagoApp(tk.Tk):
         win.title("YAML Generator Tutorial")
         win.resizable(True, True)
         win.minsize(440, 360)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
 
         self.update_idletasks()
         mx = self.winfo_rootx() + self.winfo_width() + 12
@@ -4693,6 +4696,7 @@ class TaskipelagoApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Choose Payment")
         win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         win.grab_set()
 
         ttk.Label(win, text="Choose how to pay for this task:").pack(padx=16, pady=(12, 4))
@@ -4764,6 +4768,7 @@ class TaskipelagoApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Make Change")
         win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         win.grab_set()
 
         ttk.Label(win, text=f"Currently paid: {current_label}").pack(padx=16, pady=(12, 2))
