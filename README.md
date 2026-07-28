@@ -33,3 +33,6 @@
 * Once the server is up, you can join from the client through your archipelago launcher, or via the [web client](https://barretg.github.io/Taskipelago/web-client/)
 
 * Congrats, your setup is complete!
+
+## Community YAML Submission
+[Submit your YAML Here!](https://script.google.com/macros/s/AKfycbxDgukz7NG9emJOODU2-HOMCHPJJyoIH_kSHHnpJwSEHvBSjWewhHWAG1Cd4qhH9YsuUg/exec)
