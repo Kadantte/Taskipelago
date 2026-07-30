@@ -94,6 +94,22 @@ def _collapse_items_by_count(names: list, types: list, fillers: list):
     return out_names, out_types, out_fillers, out_counts
 
 
+def _dedupe_nonfiller_names(names: list, fillers: list) -> list:
+    """
+    Disambiguate repeated names among non-filler entries only (filler-flagged
+    entries are already exempt from the duplicate-name check and left untouched).
+    """
+    seen: dict = {}
+    out = []
+    for n, is_filler in zip(names, fillers):
+        if is_filler:
+            out.append(n)
+            continue
+        seen[n] = seen.get(n, 0) + 1
+        out.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+    return out
+
+
 def _expand_by_count(values: list, counts: list) -> list:
     out = []
     for v, c in zip(values, counts):
@@ -5353,6 +5369,12 @@ class TaskipelagoApp(tk.Tk):
         item_types_out = reward_types[:n_spaces] + line_types
         item_fillers_out = item_fillers[:n_spaces] + line_fillers
         item_counts = [1] * n_spaces + line_counts
+
+        # The middle cell's reward can't be collapsed/moved (it's an uncollapsable
+        # board-cell position), so if a user reward happens to land there AND also
+        # get used elsewhere (now grouped into a line row), the two would otherwise
+        # be separate non-filler rows with an identical name. Disambiguate those.
+        item_names = _dedupe_nonfiller_names(item_names, item_fillers_out)
 
         data = {
             "name": player_name,
