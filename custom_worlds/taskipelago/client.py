@@ -62,6 +62,49 @@ def _random_filler() -> str:
     return random.choice(FILLER_ITEMS)
 
 
+def _dedupe_names(names: list) -> list:
+    """Disambiguate repeated strings by appending ' (N)' to later occurrences."""
+    seen: dict = {}
+    out = []
+    for n in names:
+        seen[n] = seen.get(n, 0) + 1
+        out.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+    return out
+
+
+def _collapse_items_by_count(names: list, types: list, fillers: list):
+    """
+    Group items sharing the same (name, type, filler flag) into single editor rows
+    with a count, regardless of position - Archipelago shuffles the item pool
+    independently of authoring order, so this is safe as long as nothing else
+    references these items by array index (bingo's item_prereqs only ever target
+    board-cell items, which are always unique).
+    """
+    order: list = []
+    counts: dict = {}
+    for key in zip(names, types, fillers):
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+    out_names = [k[0] for k in order]
+    out_types = [k[1] for k in order]
+    out_fillers = [k[2] for k in order]
+    out_counts = [counts[k] for k in order]
+    return out_names, out_types, out_fillers, out_counts
+
+
+def _expand_by_count(values: list, counts: list) -> list:
+    out = []
+    for v, c in zip(values, counts):
+        try:
+            c = max(1, int(c))
+        except (ValueError, TypeError):
+            c = 1
+        out.extend([v] * c)
+    return out
+
+
 def _bingo_lines(X: int, Y: int) -> list:
     """Return list of lists of 0-based space indices for each bingo line (rows, cols, diagonals).
 
@@ -5224,15 +5267,17 @@ class TaskipelagoApp(tk.Tk):
             )
             return
 
-        selected = random.sample(spaces_pool, n_spaces)
+        selected = _dedupe_names(random.sample(spaces_pool, n_spaces))
 
         tasks, rewards, task_prereqs, reward_prereqs, reward_types = [], [], [], [], []
+        item_fillers: list = []
         middle = n_spaces // 2
 
         for i in range(n_spaces):
             r, c = divmod(i, X)
             tasks.append(selected[i])
             rewards.append(f"Bingo {r + 1},{c + 1} Unlock")
+            item_fillers.append(False)
             task_prereqs.append("")
             reward_prereqs.append("" if i == middle else str(i + 1))
             reward_types.append("progression")
@@ -5257,6 +5302,7 @@ class TaskipelagoApp(tk.Tk):
                 name = "Diagonal Bingo (↙)" if n_anti_diags == 1 else f"Diagonal Bingo (↙ #{idx + 1})"
             tasks.append(name)
             rewards.append(_random_filler())
+            item_fillers.append(True)
             task_prereqs.append(", ".join(str(s + 1) for s in line))
             reward_prereqs.append("")
             reward_types.append("junk")
@@ -5274,7 +5320,8 @@ class TaskipelagoApp(tk.Tk):
                 )
                 return
 
-        # Assign user-provided rewards to filler slots (free space + line tasks)
+        # Assign user-provided rewards to filler slots (free space + line tasks).
+        # Duplicate reward text is allowed here - collapsed into item_count below.
         reward_pool = self._get_bingo_rewards()
         random.shuffle(reward_pool)
         reward_iter = iter(reward_pool)
@@ -5289,9 +5336,23 @@ class TaskipelagoApp(tk.Tk):
             if user_rw:
                 rewards[n_spaces + li] = user_rw
                 reward_types[n_spaces + li] = "useful"
+                item_fillers[n_spaces + li] = False
 
         bingoal = max(1, min(bingoal, L))
         goal_expr = _gen_bingoal_expr(n_spaces, L, bingoal)
+
+        # Collapse reward items sharing name/type/filler into single rows with a count.
+        # Only the line-reward tail is collapsed: board-cell items (indices 0..n_spaces-1)
+        # are referenced by absolute position in reward_prereqs, so merging any of them
+        # would shift the positions of the ones after it and break those references.
+        # Line rewards are never referenced by index, so collapsing them is always safe.
+        line_names, line_types, line_fillers, line_counts = _collapse_items_by_count(
+            rewards[n_spaces:], reward_types[n_spaces:], item_fillers[n_spaces:]
+        )
+        item_names = rewards[:n_spaces] + line_names
+        item_types_out = reward_types[:n_spaces] + line_types
+        item_fillers_out = item_fillers[:n_spaces] + line_fillers
+        item_counts = [1] * n_spaces + line_counts
 
         data = {
             "name": player_name,
@@ -5302,11 +5363,12 @@ class TaskipelagoApp(tk.Tk):
                 "accessibility": self.bingo_access_var.get(),
                 "death_link": {"true": 50, "false": 0} if self.bingo_deathlink_var.get() else {"true": 0, "false": 50},
                 "progressive_groups": [],
-                "item_progressive_group": [""] * len(tasks),
+                "item_progressive_group": [""] * len(item_names),
                 "tasks": tasks,
-                "items": rewards,
-                "item_types": reward_types,
-                "item_fillers": [False] * len(tasks),
+                "items": item_names,
+                "item_types": item_types_out,
+                "item_fillers": item_fillers_out,
+                "item_count": [str(c) for c in item_counts],
                 "task_prereqs": task_prereqs,
                 "item_prereqs": reward_prereqs,
                 "lock_prereqs": True,
@@ -5509,6 +5571,10 @@ class TaskipelagoApp(tk.Tk):
                 self.bingo_spaces_text.insert("end", s + "\n")
 
         rewards = list(block.get("items", block.get("rewards", [])) or [])
+        item_count_raw = block.get("item_count", None)
+        if item_count_raw is not None:
+            item_count_list = [item_count_raw] if not isinstance(item_count_raw, list) else list(item_count_raw)
+            rewards = _expand_by_count(rewards, item_count_list)
         middle = n_spaces // 2
         n_lines = len(_bingo_lines(X, Y))
         filler_rewards = []
