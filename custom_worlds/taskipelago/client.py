@@ -94,22 +94,6 @@ def _collapse_items_by_count(names: list, types: list, fillers: list):
     return out_names, out_types, out_fillers, out_counts
 
 
-def _dedupe_nonfiller_names(names: list, fillers: list) -> list:
-    """
-    Disambiguate repeated names among non-filler entries only (filler-flagged
-    entries are already exempt from the duplicate-name check and left untouched).
-    """
-    seen: dict = {}
-    out = []
-    for n, is_filler in zip(names, fillers):
-        if is_filler:
-            out.append(n)
-            continue
-        seen[n] = seen.get(n, 0) + 1
-        out.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
-    return out
-
-
 def _expand_by_count(values: list, counts: list) -> list:
     out = []
     for v, c in zip(values, counts):
@@ -5357,24 +5341,16 @@ class TaskipelagoApp(tk.Tk):
         bingoal = max(1, min(bingoal, L))
         goal_expr = _gen_bingoal_expr(n_spaces, L, bingoal)
 
-        # Collapse reward items sharing name/type/filler into single rows with a count.
-        # Only the line-reward tail is collapsed: board-cell items (indices 0..n_spaces-1)
-        # are referenced by absolute position in reward_prereqs, so merging any of them
-        # would shift the positions of the ones after it and break those references.
-        # Line rewards are never referenced by index, so collapsing them is always safe.
-        line_names, line_types, line_fillers, line_counts = _collapse_items_by_count(
-            rewards[n_spaces:], reward_types[n_spaces:], item_fillers[n_spaces:]
+        # Collapse reward items sharing name/type/filler into a single row with a count.
+        # item_prereqs references items by editor-row index, which generate_early
+        # translates to final positions via editor_to_yaml_item (a multi-copy row
+        # becomes an OR of all its copies) - row order is preserved by _collapse_items_by_count
+        # (first-seen order), and increasing an earlier row's count never inserts a row
+        # before a later one, so board-cell reward_prereqs references stay valid regardless
+        # of what merges with what.
+        item_names, item_types_out, item_fillers_out, item_counts = _collapse_items_by_count(
+            rewards, reward_types, item_fillers
         )
-        item_names = rewards[:n_spaces] + line_names
-        item_types_out = reward_types[:n_spaces] + line_types
-        item_fillers_out = item_fillers[:n_spaces] + line_fillers
-        item_counts = [1] * n_spaces + line_counts
-
-        # The middle cell's reward can't be collapsed/moved (it's an uncollapsable
-        # board-cell position), so if a user reward happens to land there AND also
-        # get used elsewhere (now grouped into a line row), the two would otherwise
-        # be separate non-filler rows with an identical name. Disambiguate those.
-        item_names = _dedupe_nonfiller_names(item_names, item_fillers_out)
 
         data = {
             "name": player_name,
@@ -5597,19 +5573,16 @@ class TaskipelagoApp(tk.Tk):
         if item_count_raw is not None:
             item_count_list = [item_count_raw] if not isinstance(item_count_raw, list) else list(item_count_raw)
             rewards = _expand_by_count(rewards, item_count_list)
-        middle = n_spaces // 2
-        n_lines = len(_bingo_lines(X, Y))
+
+        # Content-based, not position-based: collapsing by item_count can reorder
+        # entries sharing a name/type/filler (e.g. the middle cell's reward landing
+        # on the same text as a line reward), so every non-filler, non-board-unlock
+        # entry anywhere in the expanded list is a real user-supplied reward.
         filler_rewards = []
-        if middle < len(rewards):
-            rw = str(rewards[middle]).strip()
+        for rw in rewards:
+            rw = str(rw).strip()
             if rw and not _is_filler(rw) and not rw.startswith("Bingo "):
                 filler_rewards.append(rw)
-        for li in range(n_lines):
-            idx = n_spaces + li
-            if idx < len(rewards):
-                rw = str(rewards[idx]).strip()
-                if rw and not _is_filler(rw):
-                    filler_rewards.append(rw)
 
         self.bingo_rewards_text.delete("1.0", "end")
         for rw in filler_rewards:
