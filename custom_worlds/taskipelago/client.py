@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+import urllib.request
 from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
@@ -22,6 +23,15 @@ import websockets
 import copy
 import CommonClient
 from NetUtils import Endpoint, decode
+
+MAX_TASK_DESCRIPTION_LEN = 100
+MAX_PLAYER_NAME_LEN = 16  # Archipelago's slot name character limit
+
+REGION_COLOR_PALETTE = [
+    "#e05c5c", "#e0955c", "#e0d45c", "#8de05c",
+    "#5ce09a", "#5cd4e0", "#5c8de0", "#7b5ce0",
+    "#c05ce0", "#e05cb4", "#a0a0a0", "#5ce0c8",
+]
 
 FILLER_ITEMS = [
     "Several pats on the back",
@@ -41,6 +51,8 @@ LEGACY_FILLER_TOKEN = "nothing here, get pranked nerd"
 REWARD_TYPE_VALUES = ("junk", "useful", "progression", "trap")
 DEFAULT_REWARD_TYPE = "useful"
 
+TASK_REWARD_PREVIEW_LABELS = ["No Previews", "Scout Previews", "Hint Previews"]
+
 
 def _is_filler(s: str) -> bool:
     return s == LEGACY_FILLER_TOKEN or s in FILLER_ITEMS_SET
@@ -48,6 +60,49 @@ def _is_filler(s: str) -> bool:
 
 def _random_filler() -> str:
     return random.choice(FILLER_ITEMS)
+
+
+def _dedupe_names(names: list) -> list:
+    """Disambiguate repeated strings by appending ' (N)' to later occurrences."""
+    seen: dict = {}
+    out = []
+    for n in names:
+        seen[n] = seen.get(n, 0) + 1
+        out.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+    return out
+
+
+def _collapse_items_by_count(names: list, types: list, fillers: list):
+    """
+    Group items sharing the same (name, type, filler flag) into single editor rows
+    with a count, regardless of position - Archipelago shuffles the item pool
+    independently of authoring order, so this is safe as long as nothing else
+    references these items by array index (bingo's item_prereqs only ever target
+    board-cell items, which are always unique).
+    """
+    order: list = []
+    counts: dict = {}
+    for key in zip(names, types, fillers):
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+    out_names = [k[0] for k in order]
+    out_types = [k[1] for k in order]
+    out_fillers = [k[2] for k in order]
+    out_counts = [counts[k] for k in order]
+    return out_names, out_types, out_fillers, out_counts
+
+
+def _expand_by_count(values: list, counts: list) -> list:
+    out = []
+    for v, c in zip(values, counts):
+        try:
+            c = max(1, int(c))
+        except (ValueError, TypeError):
+            c = 1
+        out.extend([v] * c)
+    return out
 
 
 def _bingo_lines(X: int, Y: int) -> list:
@@ -195,6 +250,7 @@ def apply_dark_theme(root: tk.Tk):
     field = "#2d2d30"
     fg = "#e6e6e6"
     muted = "#bdbdbd"
+    desc = "#d4d4d4"
     border = "#3a3a3a"
 
     root.configure(bg=bg)
@@ -238,12 +294,21 @@ def apply_dark_theme(root: tk.Tk):
     style.configure("TNotebook.Tab", padding=(14, 6), background="#3a3a3a", foreground="#dddddd", borderwidth=0)
     style.map("TNotebook.Tab", background=[("selected", "#4a4a4a")], foreground=[("selected", "#ffffff")])
 
-    return {"bg": bg, "panel": panel, "border": border, "fg": fg, "muted": muted}
+    return {"bg": bg, "panel": panel, "border": border, "fg": fg, "muted": muted, "desc": desc}
 
 
 # ----------------------------
 # Scrollable container (auto-hide scrollbar)
 # ----------------------------
+class NoScrollSpinbox(ttk.Spinbox):
+    """Spinbox that ignores mouse-wheel events so scrolling never changes the value."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bind("<MouseWheel>", lambda e: "break")
+        self.bind("<Button-4>", lambda e: "break")
+        self.bind("<Button-5>", lambda e: "break")
+
+
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent, colors=None):
         super().__init__(parent)
@@ -389,6 +454,15 @@ class Tooltip:
             self._tip = None
 
 
+def _limit_var_length(var: tk.StringVar, max_len: int) -> None:
+    """Truncate a StringVar's value to max_len on every write (covers typing and paste)."""
+    def _on_write(*_):
+        val = var.get()
+        if len(val) > max_len:
+            var.set(val[:max_len])
+    var.trace_add("write", _on_write)
+
+
 def _make_tip_header(parent: tk.Widget, text: str, tip_text: str) -> ttk.Frame:
     """Return a frame with a header label and a hoverable ? tooltip icon."""
     frame = ttk.Frame(parent)
@@ -458,20 +532,31 @@ class CollapsibleSection:
 # Rows (YAML Generator)
 # ----------------------------
 class TaskRow:
-    def __init__(self, parent, index: int, on_remove, regions=None):
+    def __init__(self, parent, index: int, on_remove, regions=None, colors=None):
         self.parent = parent
         self.index = index
         self._on_remove = on_remove
+        self.colors = colors or {}
 
         self.task_var = tk.StringVar()
         self.prereq_var = tk.StringVar()
         self.item_prereq_var = tk.StringVar()
         self.cost_var = tk.StringVar()
         self.region_var = tk.StringVar(value="")
+        self.priority_var = tk.BooleanVar(value=False)
         self.count_var = tk.IntVar(value=1)
+        self.desc_var = tk.StringVar(value="")
 
         self.num_label = ttk.Label(parent, text=str(index), width=3)
-        self.task_entry = ttk.Entry(parent, textvariable=self.task_var)
+
+        self.task_cell = ttk.Frame(parent)
+        self.task_entry = ttk.Entry(self.task_cell, textvariable=self.task_var)
+        self.task_entry.pack(side="left", fill="x", expand=True)
+        self.desc_btn = ttk.Button(self.task_cell, text="Description", width=12, command=self._edit_description)
+        self.desc_btn.pack(side="left", padx=(4, 0))
+        self.desc_var.trace_add("write", lambda *_: self._refresh_desc_btn())
+        self._refresh_desc_btn()
+
         self.prereq_entry = ttk.Entry(parent, textvariable=self.prereq_var)
         self.item_prereq_entry = ttk.Entry(parent, textvariable=self.item_prereq_var)
         self.cost_entry = ttk.Entry(parent, textvariable=self.cost_var)
@@ -480,26 +565,84 @@ class TaskRow:
             values=[""] + list(regions or []),
             state="readonly", width=12,
         )
-        self.count_spinbox = ttk.Spinbox(parent, from_=1, to=999, textvariable=self.count_var, width=5)
+        self.priority_cb = ttk.Checkbutton(parent, variable=self.priority_var)
+        self.count_spinbox = NoScrollSpinbox(parent, from_=1, to=999, textvariable=self.count_var, width=5)
         self.remove_btn = ttk.Button(parent, text="Remove", width=8, command=self.remove)
 
         self._grid()
 
+    def _refresh_desc_btn(self):
+        self.desc_btn.configure(text="Description*" if self.desc_var.get().strip() else "Description")
+
+    def _edit_description(self):
+        bg = self.colors.get("bg", "#1e1e1e")
+        fg = self.colors.get("fg", "#e6e6e6")
+        panel = self.colors.get("panel", "#252526")
+        border = self.colors.get("border", "#3a3a3a")
+
+        win = tk.Toplevel(self.parent)
+        win.title("Task Description")
+        win.resizable(False, False)
+        win.configure(bg=bg)
+        win.grab_set()
+
+        tk.Label(
+            win, text=f"Optional flavor text shown under the task name in-game (max {MAX_TASK_DESCRIPTION_LEN} chars):",
+            bg=bg, fg=fg, font=("Segoe UI", 9), wraplength=360, justify="left",
+        ).pack(padx=10, pady=(10, 6), anchor="w")
+
+        text = tk.Text(
+            win, width=44, height=4, wrap="word", bg=panel, fg=fg,
+            insertbackground=fg, relief="flat",
+            highlightthickness=1, highlightbackground=border, font=("Segoe UI", 10),
+        )
+        text.pack(padx=10, pady=(0, 4))
+        text.insert("1.0", self.desc_var.get())
+
+        counter_var = tk.StringVar()
+
+        def _update_counter(*_):
+            counter_var.set(f"{len(text.get('1.0', 'end-1c'))}/{MAX_TASK_DESCRIPTION_LEN}")
+
+        def _on_key(event=None):
+            content = text.get("1.0", "end-1c")
+            if len(content) > MAX_TASK_DESCRIPTION_LEN:
+                text.delete("1.0", "end")
+                text.insert("1.0", content[:MAX_TASK_DESCRIPTION_LEN])
+            _update_counter()
+
+        text.bind("<KeyRelease>", _on_key)
+        _update_counter()
+
+        tk.Label(win, textvariable=counter_var, bg=bg, fg=self.colors.get("muted", "#bdbdbd"),
+                 font=("Segoe UI", 8)).pack(padx=10, anchor="e")
+
+        btn_row = tk.Frame(win, bg=bg)
+        btn_row.pack(padx=10, pady=(4, 10), fill="x")
+
+        def on_ok():
+            self.desc_var.set(text.get("1.0", "end-1c").strip()[:MAX_TASK_DESCRIPTION_LEN])
+            win.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_row, text="OK", command=on_ok).pack(side="right")
+
     def _grid(self):
         r = self.index + 1  # header is row 0, hint row is 1, tasks start at row 2
         self.num_label.grid(row=r, column=0, padx=(0, 8), sticky="w", pady=4)
-        self.task_entry.grid(row=r, column=1, padx=(0, 8), sticky="ew", pady=4)
+        self.task_cell.grid(row=r, column=1, padx=(0, 8), sticky="ew", pady=4)
         self.prereq_entry.grid(row=r, column=2, sticky="ew", padx=(0, 8), pady=4)
         self.item_prereq_entry.grid(row=r, column=3, sticky="ew", padx=(0, 8), pady=4)
         self.cost_entry.grid(row=r, column=4, sticky="ew", padx=(0, 8), pady=4)
         self.region_cb.grid(row=r, column=5, sticky="w", padx=(0, 8), pady=4)
-        self.count_spinbox.grid(row=r, column=6, sticky="w", padx=(0, 8), pady=4)
-        self.remove_btn.grid(row=r, column=7, padx=(0, 0), pady=4)
+        self.priority_cb.grid(row=r, column=6, padx=(0, 4), sticky="w", pady=4)
+        self.count_spinbox.grid(row=r, column=7, sticky="w", padx=(0, 8), pady=4)
+        self.remove_btn.grid(row=r, column=8, padx=(0, 0), pady=4)
 
     def remove(self):
-        for w in (self.num_label, self.task_entry, self.prereq_entry,
+        for w in (self.num_label, self.task_cell, self.prereq_entry,
                   self.item_prereq_entry, self.cost_entry, self.region_cb,
-                  self.count_spinbox, self.remove_btn):
+                  self.priority_cb, self.count_spinbox, self.remove_btn):
             try:
                 w.destroy()
             except Exception:
@@ -524,7 +667,9 @@ class TaskRow:
             self.item_prereq_var.get().strip(),
             self.cost_var.get().strip(),
             self.region_var.get().strip(),
+            bool(self.priority_var.get()),
             count,
+            self.desc_var.get().strip(),
         )
 
 
@@ -570,7 +715,7 @@ class ItemRow:
             parent, text="Consumable", variable=self.consumable_var,
             command=self.on_consumable_toggle,
         )
-        self.count_spinbox = ttk.Spinbox(parent, from_=1, to=999, textvariable=self.count_var, width=5)
+        self.count_spinbox = NoScrollSpinbox(parent, from_=1, to=999, textvariable=self.count_var, width=5)
         self.remove_btn = ttk.Button(parent, text="Remove", width=8, command=self.remove)
 
         self._grid()
@@ -758,6 +903,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.hide_unreachable_tasks = True
         self.goal_indices = []
         self.goal_expression = ""
+        self.goal_region_reqs = []
 
         self.base_reward_location_id = None
         self.base_complete_location_id = None
@@ -787,6 +933,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.seed_name = ""
         self.sent_item_names = []
         self.sent_player_names = []
+        self.task_reward_previews = 0
 
         self.progressive_groups = []
         self.reward_progressive_group = []
@@ -794,8 +941,10 @@ class TaskipelagoContext(CommonClient.CommonContext):
 
         self.regions = []
         self.region_default_pcts = {}
+        self.region_colors = []
         self.task_region = []
         self.task_region_reqs = []
+        self.task_descriptions = []
 
         self.bingo_mode = False
         self.bingo_dimension_x = 5
@@ -822,6 +971,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
         self.hide_unreachable_tasks = bool(self.slot_data.get("hide_unreachable_tasks", True))
         self.goal_indices = list(self.slot_data.get("goal_indices", []) or [])
         self.goal_expression = str(self.slot_data.get("goal_expression", "") or "")
+        self.goal_region_reqs = list(self.slot_data.get("goal_region_reqs", []) or [])
 
         self.base_reward_location_id = self.slot_data.get("base_reward_location_id")
         self.base_complete_location_id = self.slot_data.get("base_complete_location_id")
@@ -837,6 +987,7 @@ class TaskipelagoContext(CommonClient.CommonContext):
 
         self.sent_item_names = list(self.slot_data.get("sent_item_names", []))
         self.sent_player_names = list(self.slot_data.get("sent_player_names", []))
+        self.task_reward_previews = int(self.slot_data.get("task_reward_previews", 0) or 0)
 
         self.progressive_groups = list(self.slot_data.get("progressive_groups", []) or [])
         self.reward_progressive_group = list(
@@ -844,15 +995,15 @@ class TaskipelagoContext(CommonClient.CommonContext):
         )
         self.task_progressive_reqs = list(self.slot_data.get("task_progressive_reqs", []) or [])
 
-        self.task_costs = list(self.slot_data.get("task_costs", []) or [])
         self.task_cost_amounts = list(self.slot_data.get("task_cost_amounts", []) or [])
         self.item_consumable = list(self.slot_data.get("item_consumable", []) or [])
-        self.consumable_groups = dict(self.slot_data.get("consumable_groups", {}) or {})
 
         self.regions = list(self.slot_data.get("regions", []) or [])
         self.region_default_pcts = dict(self.slot_data.get("region_default_pcts", {}) or {})
+        self.region_colors = list(self.slot_data.get("region_colors", []) or [])
         self.task_region = list(self.slot_data.get("task_region", []) or [])
         self.task_region_reqs = list(self.slot_data.get("task_region_reqs", []) or [])
+        self.task_descriptions = list(self.slot_data.get("task_description", []) or [])
 
         self.bingo_mode = bool(self.slot_data.get("bingo_mode", False))
         self.bingo_dimension_x = int(self.slot_data.get("bingo_dimension_x", 5) or 5)
@@ -1199,14 +1350,8 @@ async def server_loop(ctx: TaskipelagoContext, address: str):
             print(f"[Taskipelago] Connection failed for {url}: {e!r}")
             traceback.print_exc()
 
-    # If we tried all candidates and failed, stash a human-readable reason for UI
-    try:
-        ctx._last_disconnect_reason = f"{type(last_err).__name__}: {last_err}" if last_err else "Unknown error"
-    except Exception:
-        pass
-    finally:
-        if hasattr(ctx, "on_disconnected") and callable(ctx.on_disconnected):
-            ctx.on_disconnected()
+    if hasattr(ctx, "on_disconnected") and callable(ctx.on_disconnected):
+        ctx.on_disconnected()
 
 @dataclass
 class Notification:
@@ -1214,6 +1359,73 @@ class Notification:
     title: str
     body: str
     created_at: float # time.time()
+
+# ----------------------------
+# Community YAML library (public Google Drive folder)
+# ----------------------------
+COMMUNITY_YAML_FOLDER_ID = "1-zjxfR_OHQD4OgOISBVcO6GXEZtm3-B7gUGFvkkLVSokfjBb7xtKvgoQrSk-sBrE1ycFzLgA"
+
+# The public folder's embedded view is a lightweight HTML page (no JS execution needed),
+# unlike the full Drive UI which is a JS SPA.
+_DRIVE_FILE_LINK_RE = re.compile(
+    r'<a href="https://drive\.google\.com/file/d/([-\w]{15,})/view[^"]*"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _drive_ssl_context():
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _parse_community_yaml_filename(filename: str):
+    """Return (slot, author, version) for SLOTNAME_AUTHORNAME_VERSION-WITH-DASHES.yaml, else None."""
+    lower = filename.lower()
+    if lower.endswith(".yaml"):
+        base = filename[:-5]
+    elif lower.endswith(".yml"):
+        base = filename[:-4]
+    else:
+        return None
+    parts = base.split("_")
+    if len(parts) != 3:
+        return None
+    slot, author, version_dashed = (p.strip() for p in parts)
+    if not slot or not author or not version_dashed:
+        return None
+    return slot, author, version_dashed.replace("-", ".")
+
+
+def _fetch_community_yaml_entries():
+    """Poll the public community-YAML Drive folder for compliant filenames. Raises on network failure."""
+    url = "https://drive.google.com/embeddedfolderview?id=" + COMMUNITY_YAML_FOLDER_ID
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15, context=_drive_ssl_context()) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    entries = []
+    for file_id, inner in _DRIVE_FILE_LINK_RE.findall(html):
+        filename = _HTML_TAG_RE.sub("", inner).strip()
+        parsed = _parse_community_yaml_filename(filename)
+        if parsed is None:
+            continue
+        slot, author, version = parsed
+        entries.append({
+            "file_id": file_id,
+            "filename": filename,
+            "slot": slot,
+            "author": author,
+            "version": version,
+        })
+    entries.sort(key=lambda e: (e["slot"].lower(), e["author"].lower()))
+    return entries
+
+
+def _download_community_yaml_text(file_id: str) -> str:
+    url = "https://drive.google.com/uc?export=download&id=" + file_id
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15, context=_drive_ssl_context()) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 # ----------------------------
 # Main app
@@ -1234,6 +1446,7 @@ class TaskipelagoApp(tk.Tk):
         self.pending_reward_locations = set()  # only track reward loc pending (UI completion)
         self._task_purchases: dict = {}  # {task_idx: {consumable_name: amount_spent}}
         self._manual_consumptions: dict = {}  # {consumable_name: manually consumed count}
+        self._hint_requested_indices: set = set()  # task indices already hinted this session
 
         # Incremental task-card reconciliation state
         self._task_cards: dict = {}          # {task_idx: card_dict}
@@ -1255,6 +1468,10 @@ class TaskipelagoApp(tk.Tk):
         self.prog_groups: list = []
         self.regions: list = []
         self.region_default_pcts: dict = {}
+        self.region_colors: dict = {}  # name -> hex
+        self.region_prereqs: dict = {}  # name -> raw expression text
+        self._next_color_idx: int = 0
+        self._region_rows: list = []
 
         # Notifications state
         self._notifications: list[Notification] = []
@@ -1302,27 +1519,79 @@ class TaskipelagoApp(tk.Tk):
         # YAML tab layout
         self.editor_tab.grid_columnconfigure(0, weight=1)
         self.editor_tab.grid_rowconfigure(0, weight=0)   # player name strip
-        # rows 1-3 managed dynamically by CollapsibleSection (tasks, items, deathlink)
-        self.editor_tab.grid_rowconfigure(4, weight=0, minsize=52)    # buttons
+        # rows 1-4 managed dynamically by CollapsibleSection (regions, tasks, items, deathlink)
+        self.editor_tab.grid_rowconfigure(5, weight=0, minsize=52)    # buttons
 
         # --- Player name strip (row 0) ---
         name_strip = ttk.Frame(self.editor_tab)
         name_strip.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
         ttk.Button(name_strip, text="Tutorial", command=self._open_tutorial).pack(side="right")
+        ttk.Button(name_strip, text="Community YAMLs", command=self._open_community_yamls).pack(side="right", padx=(0, 8))
         ttk.Label(name_strip, text="Player Name:").pack(side="left", padx=(0, 6))
         self.player_name_var = tk.StringVar()
+        _limit_var_length(self.player_name_var, MAX_PLAYER_NAME_LEN)
         ttk.Entry(name_strip, textvariable=self.player_name_var, width=28).pack(side="left")
+        ttk.Label(name_strip, text=f"(max {MAX_PLAYER_NAME_LEN} chars)", style="Muted.TLabel").pack(side="left", padx=(6, 0))
 
-        # ======== TASKS section (collapsible, row 1, expanded by default) ========
-        _tasks_cs = CollapsibleSection(self.editor_tab, "Tasks", row=1,
+        # ======== REGIONS section (collapsible, row 1, expanded by default) ========
+        _regions_cs = CollapsibleSection(self.editor_tab, "Regions", row=1,
+                                         expanded=False, min_height=150, colors=self.colors)
+        _regions_cs.outer.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 2))
+        regions_body = _regions_cs.body
+        regions_body.grid_columnconfigure(0, weight=1)
+        regions_body.grid_rowconfigure(0, weight=1)   # rows list
+        regions_body.grid_rowconfigure(1, weight=0)   # add row
+
+        _regions_scroll = ScrollableFrame(regions_body, colors=self.colors)
+        _regions_scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=(4, 2))
+        self.regions_chips_frame = _regions_scroll.inner
+
+        rg_add_row = ttk.Frame(regions_body)
+        rg_add_row.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
+        ttk.Label(rg_add_row, text="New region name:").pack(side="left", padx=(0, 6))
+        self.new_region_var = tk.StringVar()
+        _nr_entry = ttk.Entry(rg_add_row, textvariable=self.new_region_var, width=18)
+        _nr_entry.pack(side="left", padx=(0, 6))
+        _nr_entry.bind("<Return>", lambda _: self._add_region())
+        ttk.Label(rg_add_row, text="Default %:").pack(side="left", padx=(0, 4))
+        self.new_region_pct_var = tk.IntVar(value=100)
+        NoScrollSpinbox(rg_add_row, from_=0, to=100, textvariable=self.new_region_pct_var, width=5).pack(side="left", padx=(0, 6))
+        ttk.Button(rg_add_row, text="Add Region", command=self._add_region).pack(side="left")
+        _rg_hint = ttk.Label(
+            rg_add_row, text="(letters, underscores, hyphens - no digits)",
+            style="Muted.TLabel", cursor="question_arrow",
+        )
+        _rg_hint.pack(side="left", padx=(8, 0))
+        Tooltip(_rg_hint, (
+            "Region names may only contain letters, underscores, and hyphens - no digits.\n\n"
+            "Assign tasks to a region using the Region column in the task table.\n\n"
+            "Reference a region in 'Task prereqs' using the region name:\n"
+            "  myregion       ->  region's default % of tasks must be completed\n"
+            "  myregion-75    ->  exactly 75% of that region's tasks must be completed\n"
+            "  myregion*5     ->  exactly 5 tasks in that region must be completed\n\n"
+            "A task cannot depend on its own region.\n"
+            "Regions also appear as Archipelago regions for location hinting.\n\n"
+            "A region can also depend on other regions. Set this per-region in the\n"
+            "'Depends on' field using the same syntax:\n"
+            "  otherregion       ->  that region's default % of tasks must be completed\n"
+            "  otherregion-75    ->  exactly 75% of that region's tasks must be completed\n"
+            "  otherregion*5     ->  exactly 5 tasks in that region must be completed\n"
+            "Combine with && / || / (). A region cannot depend on itself, and\n"
+            "dependency cycles between regions are not allowed.\n\n"
+            "Click the color swatch on any region row to change its color.\n"
+            "Region names, default percentages, and dependencies are editable inline."
+        ))
+        self._refresh_regions_panel()
+
+        # ======== TASKS section (collapsible, row 2, expanded by default) ========
+        _tasks_cs = CollapsibleSection(self.editor_tab, "Tasks", row=2,
                                        expanded=True, min_height=180, colors=self.colors)
-        _tasks_cs.outer.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 2))
+        _tasks_cs.outer.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 2))
         tasks_lf = _tasks_cs.body
         tasks_lf.grid_columnconfigure(0, weight=1)
         tasks_lf.grid_rowconfigure(0, weight=0)   # settings
-        tasks_lf.grid_rowconfigure(1, weight=0)   # regions panel
-        tasks_lf.grid_rowconfigure(2, weight=1)   # table
-        tasks_lf.grid_rowconfigure(3, weight=0, minsize=40)  # button row
+        tasks_lf.grid_rowconfigure(1, weight=1)   # table
+        tasks_lf.grid_rowconfigure(2, weight=0, minsize=40)  # button row
 
         # Task settings sub-row
         task_settings = ttk.Frame(tasks_lf)
@@ -1340,50 +1609,46 @@ class TaskipelagoApp(tk.Tk):
             variable=self.hide_unreachable_tasks,
         ).pack(side="left", padx=(16, 0))
 
-        ttk.Label(task_settings, text="Goal task(s):").pack(side="left", padx=(16, 4))
+        _reward_preview_tip = (
+            "Controls whether the client shows a preview of a task's reward once that\n"
+            "task becomes available to complete (prereqs met and cost paid, if any).\n\n"
+            "No Previews: default, no network calls.\n"
+            "Scout Previews: shows the already-known reward (item + recipient) once a\n"
+            "task is available. No network calls.\n"
+            "Hint Previews: same as Scout Previews, but also sends a real Archipelago\n"
+            "hint for that task's reward location the first time it becomes available\n"
+            "each session (equivalent to typing !hint)."
+        )
+        _make_tip_header(task_settings, "Reward Previews:", _reward_preview_tip).pack(side="left", padx=(16, 4))
+        self.task_reward_previews_var = tk.StringVar(value=TASK_REWARD_PREVIEW_LABELS[0])
+        ttk.Combobox(
+            task_settings,
+            textvariable=self.task_reward_previews_var,
+            values=TASK_REWARD_PREVIEW_LABELS,
+            state="readonly",
+            width=16,
+        ).pack(side="left")
+
+        _goal_tasks_tip = (
+            "The task(s) that win the game when completed. Blank = ALL tasks required.\n\n"
+            "Same syntax as Task prereqs: task numbers, quoted task names, boolean logic,\n"
+            "and region refs:\n"
+            "  5                     ->  task 5\n"
+            "  5, 8                  ->  tasks 5 AND 8\n"
+            "  5 || 8                ->  task 5 OR task 8\n"
+            '  "Finish the project"  ->  task named exactly "Finish the project"\n'
+            "  myregion-75           ->  75% of that region's tasks completed\n\n"
+            "Quoted names resolve to the first matching task number at export.\n"
+            "The 'prev' and 'sequential' keywords are not available here (Task prereqs only)."
+        )
+        _make_tip_header(task_settings, "Goal task(s):", _goal_tasks_tip).pack(side="left", padx=(16, 4))
         self.goal_tasks_var = tk.StringVar()
         ttk.Entry(task_settings, textvariable=self.goal_tasks_var, width=16).pack(side="left")
         ttk.Label(task_settings, text="(blank = all)", style="Muted.TLabel").pack(side="left", padx=(4, 0))
 
-        # Regions panel (inside tasks section)
-        regions_frame = ttk.LabelFrame(tasks_lf, text="Regions")
-        regions_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
-        regions_frame.grid_columnconfigure(0, weight=1)
-
-        self.regions_chips_frame = ttk.Frame(regions_frame)
-        self.regions_chips_frame.grid(row=0, column=0, sticky="w", padx=10, pady=(4, 2))
-
-        rg_add_row = ttk.Frame(regions_frame)
-        rg_add_row.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
-        ttk.Label(rg_add_row, text="New region name:").pack(side="left", padx=(0, 6))
-        self.new_region_var = tk.StringVar()
-        _nr_entry = ttk.Entry(rg_add_row, textvariable=self.new_region_var, width=18)
-        _nr_entry.pack(side="left", padx=(0, 6))
-        _nr_entry.bind("<Return>", lambda _: self._add_region())
-        ttk.Label(rg_add_row, text="Default %:").pack(side="left", padx=(0, 4))
-        self.new_region_pct_var = tk.IntVar(value=100)
-        ttk.Spinbox(rg_add_row, from_=0, to=100, textvariable=self.new_region_pct_var, width=5).pack(side="left", padx=(0, 6))
-        ttk.Button(rg_add_row, text="Add Region", command=self._add_region).pack(side="left")
-        _rg_hint = ttk.Label(
-            rg_add_row, text="(letters, underscores, hyphens - no digits)",
-            style="Muted.TLabel", cursor="question_arrow",
-        )
-        _rg_hint.pack(side="left", padx=(8, 0))
-        Tooltip(_rg_hint, (
-            "Region names may only contain letters, underscores, and hyphens - no digits.\n\n"
-            "Assign tasks to a region using the Region column in the task table.\n\n"
-            "Reference a region in 'Task prereqs' using the region name:\n"
-            "  myregion       ->  region's default % of tasks must be completed\n"
-            "  myregion-75    ->  exactly 75% of that region's tasks must be completed\n"
-            "  myregion*5     ->  exactly 5 tasks in that region must be completed\n\n"
-            "A task cannot depend on its own region.\n"
-            "Regions also appear as Archipelago regions for location hinting."
-        ))
-        self._refresh_regions_panel()
-
         # Tasks scrollable table
         self.tasks_scroll = ScrollableFrame(tasks_lf, colors=self.colors)
-        self.tasks_scroll.grid(row=2, column=0, sticky="nsew", padx=10, pady=0)
+        self.tasks_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=0)
 
         t_tbl = self.tasks_scroll.inner
         t_tbl.grid_columnconfigure(0, weight=0)   # #
@@ -1391,9 +1656,10 @@ class TaskipelagoApp(tk.Tk):
         t_tbl.grid_columnconfigure(2, weight=2)   # Task prereqs
         t_tbl.grid_columnconfigure(3, weight=2)   # Item prereqs
         t_tbl.grid_columnconfigure(4, weight=2)   # Cost
-        t_tbl.grid_columnconfigure(5, weight=1)   # Region
-        t_tbl.grid_columnconfigure(6, weight=0)   # Count
-        t_tbl.grid_columnconfigure(7, weight=0)   # Remove
+        t_tbl.grid_columnconfigure(5, weight=2)   # Region
+        t_tbl.grid_columnconfigure(6, weight=0)   # Priority
+        t_tbl.grid_columnconfigure(7, weight=0)   # Count
+        t_tbl.grid_columnconfigure(8, weight=0)   # Remove
 
         ttk.Label(t_tbl, text="#").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(t_tbl, text="Task").grid(row=0, column=1, sticky="w", padx=(0, 8))
@@ -1409,9 +1675,14 @@ class TaskipelagoApp(tk.Tk):
             "  myregion      ->  region's default % of tasks must be completed\n"
             "  myregion-75   ->  exactly 75% of that region's tasks must be completed\n"
             "  myregion*5    ->  exactly 5 tasks in that region must be completed\n\n"
+            "Reserved keywords (Task prereqs only, not Item prereqs or Goal Tasks):\n"
+            "  prev                    ->  the task immediately before this one\n"
+            '  sequential && "Chore"   ->  with Count > 1, chains each duplicate to the\n'
+            "                              one before it (first copy just needs \"Chore\")\n\n"
             "Quoted names resolve to the first matching task number at export.\n"
             "Quotation marks are not allowed in task names.\n"
-            "A task cannot depend on its own region."
+            "A task cannot depend on its own region.\n"
+            "'prev' and 'sequential' cannot be used as region or progressive group names."
         )
         _item_prereq_tip = (
             "Which items must be RECEIVED before this task can be checked off.\n\n"
@@ -1452,14 +1723,23 @@ class TaskipelagoApp(tk.Tk):
             "How many times this task is duplicated in the exported YAML.\n\n"
             "All copies are generated with identical configuration.\n"
             "A prereq referencing this task requires ALL copies to be completed.\n"
-            "Consecutive duplicate task rows are crunched into one row on import."
+            "Consecutive duplicate task rows are crunched into one row on import.\n\n"
+            "Add 'sequential' to this task's prereqs to chain the copies in order "
+            "(each copy after the first depends on the one before it)."
+        )
+        _priority_col_tip = (
+            "Marks this task's reward location as an Archipelago priority location.\n\n"
+            "Archipelago will try to place a progression or otherwise important item there "
+            "instead of junk/filler.\n\n"
+            "Uses Archipelago's built-in priority_locations mechanism -- no extra setup needed."
         )
         _make_tip_header(t_tbl, "Task prereqs", _task_prereq_tip).grid(row=0, column=2, sticky="w", padx=(0, 8))
         _make_tip_header(t_tbl, "Item prereqs", _item_prereq_tip).grid(row=0, column=3, sticky="w", padx=(0, 8))
         _make_tip_header(t_tbl, "Cost",         _cost_col_tip).grid(row=0, column=4, sticky="w", padx=(0, 8))
         _make_tip_header(t_tbl, "Region",       _region_col_tip).grid(row=0, column=5, sticky="w", padx=(0, 8))
-        _make_tip_header(t_tbl, "Count",        _count_task_tip).grid(row=0, column=6, sticky="w", padx=(0, 8))
-        ttk.Label(t_tbl, text="").grid(row=0, column=7, sticky="w")
+        _make_tip_header(t_tbl, "Prio",         _priority_col_tip).grid(row=0, column=6, sticky="w", padx=(0, 4))
+        _make_tip_header(t_tbl, "Count",        _count_task_tip).grid(row=0, column=7, sticky="w", padx=(0, 8))
+        ttk.Label(t_tbl, text="").grid(row=0, column=8, sticky="w")
 
         ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8))
         ttk.Label(t_tbl, text="Location", style="Muted.TLabel").grid(row=1, column=1, sticky="w", padx=(0, 8))
@@ -1467,17 +1747,18 @@ class TaskipelagoApp(tk.Tk):
         ttk.Label(t_tbl, text='1  or  "Item Name"', style="Muted.TLabel").grid(row=1, column=3, sticky="w", padx=(0, 8))
         ttk.Label(t_tbl, text='"ItemName"*N', style="Muted.TLabel").grid(row=1, column=4, sticky="w", padx=(0, 8))
         ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=5, sticky="w", padx=(0, 8))
-        ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=6, sticky="w", padx=(0, 8))
-        ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=7, sticky="w")
+        ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=6, sticky="w", padx=(0, 4))
+        ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=7, sticky="w", padx=(0, 8))
+        ttk.Label(t_tbl, text="", style="Muted.TLabel").grid(row=1, column=8, sticky="w")
 
         tasks_btn_row = ttk.Frame(tasks_lf)
-        tasks_btn_row.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 8))
+        tasks_btn_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 8))
         ttk.Button(tasks_btn_row, text="Add Task", command=self.add_task_row).pack(side="left")
 
-        # ======== ITEMS section (collapsible, row 2, expanded by default) ========
-        _items_cs = CollapsibleSection(self.editor_tab, "Items", row=2,
+        # ======== ITEMS section (collapsible, row 3, expanded by default) ========
+        _items_cs = CollapsibleSection(self.editor_tab, "Items", row=3,
                                        expanded=True, min_height=200, colors=self.colors)
-        _items_cs.outer.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 2))
+        _items_cs.outer.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 2))
         items_lf = _items_cs.body
         items_lf.grid_columnconfigure(0, weight=1)
         items_lf.grid_rowconfigure(0, weight=0)   # settings
@@ -1491,7 +1772,7 @@ class TaskipelagoApp(tk.Tk):
 
         ttk.Label(item_settings, text="Progression Balancing (0-99):").pack(side="left", padx=(0, 4))
         self.progression_var = tk.IntVar(value=50)
-        ttk.Spinbox(item_settings, from_=0, to=99, textvariable=self.progression_var, width=5).pack(side="left")
+        NoScrollSpinbox(item_settings, from_=0, to=99, textvariable=self.progression_var, width=5).pack(side="left")
 
         ttk.Label(item_settings, text="Accessibility:").pack(side="left", padx=(16, 4))
         self.accessibility_var = tk.StringVar(value="full")
@@ -1612,10 +1893,10 @@ class TaskipelagoApp(tk.Tk):
         )
         self.add_item_btn.pack(side="left")
 
-        # ======== DEATHLINK section (collapsible, row 3, collapsed by default) ========
-        _dl_cs = CollapsibleSection(self.editor_tab, "DeathLink", row=3,
+        # ======== DEATHLINK section (collapsible, row 4, collapsed by default) ========
+        _dl_cs = CollapsibleSection(self.editor_tab, "DeathLink", row=4,
                                     expanded=False, min_height=120, colors=self.colors)
-        _dl_cs.outer.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 2))
+        _dl_cs.outer.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 2))
         dl = _dl_cs.body
         dl.grid_columnconfigure(0, weight=1)
         dl.grid_rowconfigure(0, weight=0)   # settings
@@ -1630,7 +1911,7 @@ class TaskipelagoApp(tk.Tk):
 
         ttk.Label(dl_settings, text="Amnesty:").pack(side="left", padx=(16, 4))
         self.deathlink_amnesty_var = tk.IntVar(value=0)
-        ttk.Spinbox(dl_settings, from_=0, to=999, textvariable=self.deathlink_amnesty_var, width=5).pack(side="left")
+        NoScrollSpinbox(dl_settings, from_=0, to=999, textvariable=self.deathlink_amnesty_var, width=5).pack(side="left")
 
         self.dl_scroll = ScrollableFrame(dl, colors=self.colors)
         self.dl_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 0))
@@ -1647,9 +1928,9 @@ class TaskipelagoApp(tk.Tk):
             row=2, column=0, sticky="w", padx=10, pady=(0, 10)
         )
 
-        # ======== Bottom buttons (row 4) ========
+        # ======== Bottom buttons (row 5) ========
         bottom = ttk.Frame(self.editor_tab)
-        bottom.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        bottom.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         bottom.grid_columnconfigure(0, weight=1)
         ttk.Button(bottom, text="Reset", command=self.reset_yaml_generator).grid(
             row=0, column=0, sticky="w", padx=(10, 0)
@@ -1674,7 +1955,6 @@ class TaskipelagoApp(tk.Tk):
 
         conn_frame = ttk.LabelFrame(play_root, text="Connection")
         conn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=(0, 10))
-        # conn_frame.pack(fill="x", pady=(0, 10))
 
         last = self._load_last_connection()
         server_default = str(last.get("server") or "archipelago.gg")
@@ -1708,7 +1988,6 @@ class TaskipelagoApp(tk.Tk):
         # shown only when connected with deathlink enabled
 
         self.connect_status = tk.StringVar(value="Not connected.")
-        # ttk.Label(play_root, textvariable=self.connect_status).pack(anchor="w")
         ttk.Label(play_root, textvariable=self.connect_status).grid(row=1, column=0, sticky="w", padx=(0, 10))
 
         tasks_frame = ttk.LabelFrame(play_root, text="Tasks")
@@ -1743,6 +2022,18 @@ class TaskipelagoApp(tk.Tk):
             command=self.refresh_play_tab,
         )
         self._hide_completed_checkbox.pack(side="left", padx=(8, 8), pady=4)
+
+        self._region_progress_expanded = True
+        self._region_progress_outer = ttk.Frame(tasks_frame)
+        _rp_hdr = ttk.Frame(self._region_progress_outer)
+        _rp_hdr.pack(fill="x")
+        self._region_progress_toggle_btn = ttk.Button(
+            _rp_hdr, text="[-] Regions", width=14,
+            command=self._toggle_region_progress,
+        )
+        self._region_progress_toggle_btn.pack(side="left", padx=(6, 0), pady=2)
+        self._region_progress_inner = ttk.Frame(self._region_progress_outer)
+        self._region_progress_inner.pack(fill="x", padx=6, pady=(0, 4))
 
         self.play_tasks_scroll = ScrollableFrame(tasks_frame, colors=self.colors)
         self.play_tasks_scroll.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1814,6 +2105,7 @@ class TaskipelagoApp(tk.Tk):
             len(self.task_rows) + 1,
             self._remove_task_row,
             list(self.regions),
+            colors=self.colors,
         )
         self.task_rows.append(row)
         row.count_var.trace_add("write", lambda *_: self._update_item_counter())
@@ -1855,12 +2147,16 @@ class TaskipelagoApp(tk.Tk):
 
     # ---------------- Progressive groups management ----------------
     def _add_prog_group(self):
+        from .prereq_parser import RESERVED_WORDS
         name = self.new_group_var.get().strip()
         if not name:
             messagebox.showerror("Error", "Group name cannot be empty.")
             return
         if re.search(r'\d', name):
             messagebox.showerror("Error", f"Group name '{name}' must not contain digits.")
+            return
+        if name.lower() in RESERVED_WORDS:
+            messagebox.showerror("Error", f"Group name '{name}' is a reserved word.")
             return
         if name in self.prog_groups:
             messagebox.showerror("Error", f"Progressive group '{name}' already exists.")
@@ -1902,19 +2198,29 @@ class TaskipelagoApp(tk.Tk):
 
     # ---------------- Region management ----------------
     def _add_region(self):
+        from .prereq_parser import RESERVED_WORDS
         name = self.new_region_var.get().strip()
         if not name:
             messagebox.showerror("Error", "Region name cannot be empty.")
             return
-        if re.search(r'\d', name):
-            messagebox.showerror("Error", f"Region name '{name}' must not contain digits.")
+        if not re.match(r'^[a-zA-Z_][a-zA-Z_-]*$', name) or re.search(r'\d', name) or name.endswith('-'):
+            messagebox.showerror("Error",
+                f"Region name '{name}' is invalid.\n"
+                "Names must start and end with a letter or underscore, "
+                "may contain hyphens in the middle, and must not contain spaces or digits.")
+            return
+        if name.lower() in RESERVED_WORDS:
+            messagebox.showerror("Error", f"Region name '{name}' is a reserved word.")
             return
         if name in self.regions:
             messagebox.showerror("Error", f"Region '{name}' already exists.")
             return
         pct = self.new_region_pct_var.get()
+        color = REGION_COLOR_PALETTE[self._next_color_idx % len(REGION_COLOR_PALETTE)]
+        self._next_color_idx += 1
         self.regions.append(name)
         self.region_default_pcts[name] = int(pct)
+        self.region_colors[name] = color
         self.new_region_var.set("")
         self.new_region_pct_var.set(100)
         self._refresh_regions_panel()
@@ -1924,27 +2230,210 @@ class TaskipelagoApp(tk.Tk):
         if rname in self.regions:
             self.regions.remove(rname)
         self.region_default_pcts.pop(rname, None)
+        self.region_colors.pop(rname, None)
+        self.region_prereqs.pop(rname, None)
         for row in self.task_rows:
             if row.region_var.get() == rname:
                 row.region_var.set("")
         self._refresh_regions_panel()
         self._update_all_task_row_regions()
 
+    def _pick_region_color(self, row_data: dict):
+        name = row_data["committed_name"]
+        current = self.region_colors.get(name, REGION_COLOR_PALETTE[0])
+        border = self.colors.get("border", "#3a3a3a")
+        bg = self.colors.get("bg", "#1e1e1e")
+        fg = self.colors.get("fg", "#e6e6e6")
+        panel = self.colors.get("panel", "#252526")
+
+        win = tk.Toplevel(self)
+        win.title(f"Region Color: {name}")
+        win.resizable(False, False)
+        win.configure(bg=bg)
+        win.grab_set()
+
+        selected = [current]
+
+        tk.Label(win, text="Preset colors:", bg=bg, fg=fg,
+                 font=("Segoe UI", 10)).pack(padx=10, pady=(10, 4), anchor="w")
+
+        palette_frame = tk.Frame(win, bg=bg)
+        palette_frame.pack(padx=10, pady=(0, 8))
+
+        preview_var = [None]
+
+        def pick_preset(color):
+            selected[0] = color
+            hex_var.set(color)
+            try:
+                preview_var[0].configure(bg=color)
+            except Exception:
+                pass
+
+        for idx, color in enumerate(REGION_COLOR_PALETTE):
+            c = tk.Canvas(palette_frame, width=24, height=24, bg=color,
+                          highlightthickness=2,
+                          highlightbackground="#ffffff" if color == current else border,
+                          cursor="hand2")
+            c.grid(row=idx // 6, column=idx % 6, padx=2, pady=2)
+            c.bind("<Button-1>", lambda e, col=color: pick_preset(col))
+
+        tk.Label(win, text="Hex code:", bg=bg, fg=fg,
+                 font=("Segoe UI", 10)).pack(padx=10, pady=(0, 2), anchor="w")
+        hex_var = tk.StringVar(value=current)
+        hex_entry = tk.Entry(win, textvariable=hex_var, width=10, bg=panel, fg=fg,
+                             insertbackground=fg, relief="flat",
+                             highlightthickness=1, highlightbackground=border)
+        hex_entry.pack(padx=10, pady=(0, 6), anchor="w")
+
+        preview = tk.Canvas(win, width=40, height=24, bg=current,
+                            highlightthickness=1, highlightbackground=border)
+        preview.pack(padx=10, pady=(0, 8))
+        preview_var[0] = preview
+
+        def on_hex_change(*_):
+            val = hex_var.get().strip()
+            if not val.startswith("#"):
+                val = "#" + val
+            try:
+                win.winfo_rgb(val)
+                selected[0] = val
+                preview.configure(bg=val)
+            except Exception:
+                pass
+
+        hex_var.trace_add("write", on_hex_change)
+
+        btn_row = tk.Frame(win, bg=bg)
+        btn_row.pack(padx=10, pady=(0, 10), fill="x")
+
+        def on_ok():
+            new_color = selected[0]
+            self.region_colors[name] = new_color
+            try:
+                row_data["swatch"].configure(bg=new_color)
+            except Exception:
+                pass
+            win.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_row, text="OK", command=on_ok).pack(side="right")
+
+    def _commit_region_rename(self, row_data: dict):
+        from .prereq_parser import RESERVED_WORDS
+        old_name = row_data["committed_name"]
+        new_name = row_data["name_var"].get().strip()
+        if new_name == old_name:
+            return
+        if not new_name:
+            row_data["name_var"].set(old_name)
+            return
+        if not re.match(r'^[a-zA-Z_][a-zA-Z_-]*$', new_name) or re.search(r'\d', new_name) or new_name.endswith('-'):
+            messagebox.showerror("Error",
+                f"Region name '{new_name}' is invalid.\n"
+                "Names must start and end with a letter or underscore, "
+                "may contain hyphens in the middle, and must not contain spaces or digits.")
+            row_data["name_var"].set(old_name)
+            return
+        if new_name.lower() in RESERVED_WORDS:
+            messagebox.showerror("Error", f"Region name '{new_name}' is a reserved word.")
+            row_data["name_var"].set(old_name)
+            return
+        if new_name in self.regions:
+            messagebox.showerror("Error", f"Region '{new_name}' already exists.")
+            row_data["name_var"].set(old_name)
+            return
+        idx = self.regions.index(old_name)
+        self.regions[idx] = new_name
+        if old_name in self.region_default_pcts:
+            self.region_default_pcts[new_name] = self.region_default_pcts.pop(old_name)
+        if old_name in self.region_colors:
+            self.region_colors[new_name] = self.region_colors.pop(old_name)
+        if old_name in self.region_prereqs:
+            self.region_prereqs[new_name] = self.region_prereqs.pop(old_name)
+        for task_row in self.task_rows:
+            if task_row.region_var.get() == old_name:
+                task_row.region_var.set(new_name)
+        row_data["committed_name"] = new_name
+        self._update_all_task_row_regions()
+
+    def _commit_region_pct(self, row_data: dict):
+        name = row_data["committed_name"]
+        try:
+            pct = max(0, min(100, int(row_data["pct_var"].get())))
+        except (ValueError, tk.TclError):
+            pct = self.region_default_pcts.get(name, 100)
+        self.region_default_pcts[name] = pct
+        row_data["pct_var"].set(pct)
+
+    def _commit_region_prereq_text(self, row_data: dict):
+        name = row_data["committed_name"]
+        self.region_prereqs[name] = row_data["prereq_var"].get().strip()
+
     def _refresh_regions_panel(self):
         if not hasattr(self, "regions_chips_frame"):
             return
         for w in self.regions_chips_frame.winfo_children():
             w.destroy()
+        self._region_rows = []
+
         if not self.regions:
-            ttk.Label(self.regions_chips_frame, text="No regions defined.", style="Muted.TLabel").pack(side="left")
+            ttk.Label(self.regions_chips_frame, text="No regions defined.", style="Muted.TLabel").pack(anchor="w", pady=4)
             return
+
+        border = self.colors.get("border", "#3a3a3a")
+
+        # Header labels
+        hdr = ttk.Frame(self.regions_chips_frame)
+        hdr.pack(fill="x", pady=(0, 2))
+        ttk.Label(hdr, text="Color", style="Muted.TLabel", width=6).pack(side="left", padx=(0, 4))
+        ttk.Label(hdr, text="Name", style="Muted.TLabel", width=18).pack(side="left", padx=(0, 6))
+        ttk.Label(hdr, text="Default %", style="Muted.TLabel", width=10).pack(side="left", padx=(0, 6))
+        ttk.Label(hdr, text="Depends on", style="Muted.TLabel", width=22).pack(side="left", padx=(0, 6))
+
         for rname in self.regions:
             pct = self.region_default_pcts.get(rname, 100)
-            chip = ttk.Frame(self.regions_chips_frame)
-            chip.pack(side="left", padx=(0, 6))
-            ttk.Label(chip, text=f"{rname} ({pct}%)").pack(side="left", padx=(0, 2))
-            ttk.Button(chip, text="x", width=2,
-                       command=lambda r=rname: self._remove_region(r)).pack(side="left")
+            color = self.region_colors.get(rname, "#808080")
+
+            row_data = {
+                "committed_name": rname,
+                "name_var": tk.StringVar(value=rname),
+                "pct_var": tk.IntVar(value=pct),
+                "prereq_var": tk.StringVar(value=self.region_prereqs.get(rname, "")),
+                "swatch": None,
+            }
+
+            row = ttk.Frame(self.regions_chips_frame)
+            row.pack(fill="x", pady=2)
+
+            swatch = tk.Canvas(row, width=18, height=18, bg=color,
+                               highlightthickness=1, highlightbackground=border,
+                               cursor="hand2")
+            swatch.pack(side="left", padx=(0, 6))
+            row_data["swatch"] = swatch
+            swatch.bind("<Button-1>", lambda e, rd=row_data: self._pick_region_color(rd))
+
+            name_entry = ttk.Entry(row, textvariable=row_data["name_var"], width=18)
+            name_entry.pack(side="left", padx=(0, 6))
+            name_entry.bind("<FocusOut>", lambda e, rd=row_data: self._commit_region_rename(rd))
+            name_entry.bind("<Return>", lambda e, rd=row_data: self._commit_region_rename(rd))
+
+            ttk.Label(row, text="Default %:").pack(side="left", padx=(0, 4))
+            pct_spin = NoScrollSpinbox(row, from_=0, to=100, textvariable=row_data["pct_var"], width=5)
+            pct_spin.pack(side="left", padx=(0, 8))
+            pct_spin.bind("<FocusOut>", lambda e, rd=row_data: self._commit_region_pct(rd))
+            pct_spin.bind("<Return>", lambda e, rd=row_data: self._commit_region_pct(rd))
+
+            prereq_entry = ttk.Entry(row, textvariable=row_data["prereq_var"], width=22)
+            prereq_entry.pack(side="left", padx=(0, 8))
+            prereq_entry.bind("<FocusOut>", lambda e, rd=row_data: self._commit_region_prereq_text(rd))
+            prereq_entry.bind("<Return>", lambda e, rd=row_data: self._commit_region_prereq_text(rd))
+
+            ttk.Button(row, text="Remove", width=7,
+                       command=lambda rd=row_data: self._remove_region(rd["committed_name"])
+                       ).pack(side="left")
+
+            self._region_rows.append(row_data)
 
     def _update_all_task_row_regions(self):
         for row in self.task_rows:
@@ -2074,9 +2563,9 @@ class TaskipelagoApp(tk.Tk):
             messagebox.showerror("Error", "Player name is required.")
             return
 
-        tasks, task_prereqs, item_prereqs_raw, task_costs, task_region_list, task_counts = [], [], [], [], [], []
+        tasks, task_prereqs, item_prereqs_raw, task_costs, task_region_list, task_priority_list, task_counts, task_descriptions = [], [], [], [], [], [], [], []
         for r in self.task_rows:
-            t, tpr, ipr, cost, treg, count = r.get_data()
+            t, tpr, ipr, cost, treg, priority, count, desc = r.get_data()
             if not t:
                 continue
             tasks.append(t)
@@ -2084,7 +2573,9 @@ class TaskipelagoApp(tk.Tk):
             item_prereqs_raw.append(ipr or "")
             task_costs.append(cost or "")
             task_region_list.append(treg or "")
+            task_priority_list.append(priority)
             task_counts.append(count)
+            task_descriptions.append((desc or "")[:MAX_TASK_DESCRIPTION_LEN])
 
         if not tasks:
             messagebox.showerror("Error", "No tasks defined.")
@@ -2104,17 +2595,28 @@ class TaskipelagoApp(tk.Tk):
             return
 
         raw_item_names = []
+        raw_item_consumables = []
         items, item_types, item_fillers, item_prog_groups, item_consumables, item_counts = [], [], [], [], [], []
         for r in self.item_rows:
             itm, filler, itype, pgrp, consumable, count = r.get_data()
             raw_item_names.append(itm)
             is_filler_row = filler or not itm
-            items.append(_random_filler() if is_filler_row else itm)
-            item_types.append("junk" if is_filler_row else (itype or "junk"))
-            item_fillers.append(bool(is_filler_row))
-            item_prog_groups.append(pgrp if not is_filler_row else "")
-            item_consumables.append(consumable if not is_filler_row else False)
-            item_counts.append(count)
+            raw_item_consumables.append(consumable if not is_filler_row else False)
+            if is_filler_row and count > 1:
+                for _ in range(count):
+                    items.append(_random_filler())
+                    item_types.append("junk")
+                    item_fillers.append(True)
+                    item_prog_groups.append("")
+                    item_consumables.append(False)
+                    item_counts.append(1)
+            else:
+                items.append(_random_filler() if is_filler_row else itm)
+                item_types.append("junk" if is_filler_row else (itype or "junk"))
+                item_fillers.append(bool(is_filler_row))
+                item_prog_groups.append(pgrp if not is_filler_row else "")
+                item_consumables.append(consumable if not is_filler_row else False)
+                item_counts.append(count)
 
         # Duplicate item name check (non-filler items only)
         _seen_items = {}
@@ -2127,6 +2629,39 @@ class TaskipelagoApp(tk.Tk):
                 "Duplicate Item Names",
                 "Duplicate item names are not allowed - use the Count field for multiple copies:\n"
                 + "\n".join(_dup_items)
+            )
+            return
+
+        from .prereq_parser import RESERVED_WORDS
+        _bad_regions = [
+            r for r in self.regions
+            if not re.match(r'^[a-zA-Z_][a-zA-Z_-]*$', r) or re.search(r'\d', r) or r.endswith('-')
+        ]
+        if _bad_regions:
+            messagebox.showerror(
+                "Invalid Region Names",
+                "The following region names are invalid and cannot be exported.\n"
+                "Names must start and end with a letter or underscore, may contain hyphens in the middle, "
+                "and must not contain digits:\n\n"
+                + "\n".join(_bad_regions)
+            )
+            return
+
+        _reserved_regions = [r for r in self.regions if r.lower() in RESERVED_WORDS]
+        if _reserved_regions:
+            messagebox.showerror(
+                "Invalid Region Names",
+                "The following region names are reserved words and cannot be exported:\n\n"
+                + "\n".join(_reserved_regions)
+            )
+            return
+
+        _reserved_groups = [g for g in self.prog_groups if g.lower() in RESERVED_WORDS]
+        if _reserved_groups:
+            messagebox.showerror(
+                "Invalid Progressive Group Names",
+                "The following progressive group names are reserved words and cannot be exported:\n\n"
+                + "\n".join(_reserved_groups)
             )
             return
 
@@ -2197,6 +2732,72 @@ class TaskipelagoApp(tk.Tk):
 
         goal_tasks_raw = self.goal_tasks_var.get().strip()
 
+        # --- Prereq / cost expression validation ---
+        try:
+            from .prereq_parser import parse_prereq, parse_cost_expr
+        except ImportError:
+            parse_prereq = None
+            parse_cost_expr = None
+
+        if parse_prereq is not None:
+            region_set = set(self.regions)
+            group_set = set(self.prog_groups)
+            consumable_set = {
+                nm for nm, cons in zip(raw_item_names, raw_item_consumables) if cons and nm
+            }
+            n = len(tasks)
+            n_items = len(items)
+            expr_errors = []
+
+            for i, tpr in enumerate(task_prereqs):
+                if tpr:
+                    resolved, _ = self._resolve_name_refs(tpr, tasks)
+                    try:
+                        parse_prereq(resolved, n, i, "task prereq", known_groups=group_set, known_regions=region_set)
+                    except Exception as e:
+                        expr_errors.append(str(e))
+
+            for i, ipr in enumerate(item_prereqs_raw):
+                if ipr:
+                    resolved, _ = self._resolve_name_refs(ipr, raw_item_names)
+                    try:
+                        parse_prereq(resolved, n_items, i, "item prereq", known_groups=group_set)
+                    except Exception as e:
+                        expr_errors.append(str(e))
+
+            for i, cost in enumerate(task_costs):
+                if cost:
+                    try:
+                        parse_cost_expr(cost, consumable_set, raw_item_names)
+                    except Exception as e:
+                        expr_errors.append(f"Task {i + 1} cost: {e}")
+
+            if goal_tasks_raw:
+                resolved_goal, goal_name_errs = self._resolve_name_refs(goal_tasks_raw, tasks)
+                if goal_name_errs:
+                    expr_errors.append("Goal tasks: " + "; ".join(goal_name_errs))
+                else:
+                    try:
+                        parse_prereq(resolved_goal, n, 0, "goal tasks", known_regions=region_set)
+                    except Exception as e:
+                        expr_errors.append(f"Goal tasks: {e}")
+
+            for rname in self.regions:
+                rpr = self.region_prereqs.get(rname, "")
+                if rpr:
+                    try:
+                        parse_prereq(rpr, 0, 0, "region prereq", known_regions=region_set)
+                    except Exception as e:
+                        expr_errors.append(str(e))
+
+            if expr_errors:
+                messagebox.showerror(
+                    "Invalid Expressions",
+                    "The following expressions could not be parsed and must be fixed before exporting:\n\n"
+                    + "\n".join(expr_errors)
+                )
+                return
+
         data = {
             "name": player_name,
             "game": "Taskipelago",
@@ -2211,10 +2812,14 @@ class TaskipelagoApp(tk.Tk):
 
                 "regions": list(self.regions),
                 "region_default_pcts": [self.region_default_pcts.get(r, 100) for r in self.regions],
+                "region_colors": [self.region_colors.get(r, "") for r in self.regions],
+                "region_prereqs": [self.region_prereqs.get(r, "") for r in self.regions],
                 "task_region": task_region_list,
+                "task_priority": ["true" if p else "false" for p in task_priority_list],
 
                 "tasks": tasks,
                 "task_count": [str(c) for c in task_counts],
+                "task_description": task_descriptions,
                 "items": items,
                 "item_types": item_types,
                 "item_fillers": item_fillers,
@@ -2225,6 +2830,7 @@ class TaskipelagoApp(tk.Tk):
                 "task_cost": task_costs,
                 "lock_prereqs": bool(self.lock_prereqs_var.get()),
                 "hide_unreachable_tasks": bool(self.hide_unreachable_tasks.get()),
+                "task_reward_previews": TASK_REWARD_PREVIEW_LABELS.index(self.task_reward_previews_var.get()),
                 "goal_tasks": [goal_tasks_raw] if goal_tasks_raw else [],
 
                 "death_link_pool": deathlink_pool,
@@ -2254,6 +2860,10 @@ class TaskipelagoApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to read YAML:\n{e}")
             return
 
+        if self._populate_from_taskipelago_doc(doc):
+            messagebox.showinfo("Imported", f"Imported YAML from:\n{path}")
+
+    def _populate_from_taskipelago_doc(self, doc) -> bool:
         player_name, block = self._extract_taskipelago_block(doc)
         if not isinstance(block, dict):
             messagebox.showerror(
@@ -2263,7 +2873,7 @@ class TaskipelagoApp(tk.Tk):
                 "  - root: { name: ..., Taskipelago: {...} }\n"
                 "  - or a player entry: { <player>: { Taskipelago: {...} } }"
             )
-            return
+            return False
 
         # --------- Populate global settings ---------
         if player_name:
@@ -2300,6 +2910,14 @@ class TaskipelagoApp(tk.Tk):
         self.lock_prereqs_var.set(bool(block.get("lock_prereqs", self.lock_prereqs_var.get())))
         self.hide_unreachable_tasks.set(bool(block.get("hide_unreachable_tasks", self.hide_unreachable_tasks.get())))
 
+        try:
+            trp_idx = int(block.get("task_reward_previews", 0) or 0)
+        except (TypeError, ValueError):
+            trp_idx = 0
+        if trp_idx not in (0, 1, 2):
+            trp_idx = 0
+        self.task_reward_previews_var.set(TASK_REWARD_PREVIEW_LABELS[trp_idx])
+
         goal_tasks = list(block.get("goal_tasks", []) or [])
         self.goal_tasks_var.set(", ".join(str(g) for g in goal_tasks))
 
@@ -2311,21 +2929,31 @@ class TaskipelagoApp(tk.Tk):
         # --------- Regions (must be loaded before task rows) ---------
         raw_rg = list(block.get("regions", []) or [])
         raw_rdp = list(block.get("region_default_pcts", []) or [])
+        raw_rcolors = list(block.get("region_colors", []) or [])
+        raw_rpr = list(block.get("region_prereqs", []) or [])
         self.regions = [str(r).strip() for r in raw_rg if str(r).strip()]
         self.region_default_pcts = {}
+        self.region_colors = {}
+        self.region_prereqs = {}
+        self._next_color_idx = len(self.regions)
         for i, rname in enumerate(self.regions):
             try:
                 pct = int(raw_rdp[i]) if i < len(raw_rdp) else 100
             except (ValueError, TypeError):
                 pct = 100
             self.region_default_pcts[rname] = pct
+            color = str(raw_rcolors[i]).strip() if i < len(raw_rcolors) else ""
+            self.region_colors[rname] = color if color else REGION_COLOR_PALETTE[i % len(REGION_COLOR_PALETTE)]
+            self.region_prereqs[rname] = str(raw_rpr[i]).strip() if i < len(raw_rpr) else ""
         self._refresh_regions_panel()
 
         # --------- Read tasks ---------
         tasks_raw = list(block.get("tasks", []) or [])
         prereqs_raw = list(block.get("task_prereqs", []) or [])
         task_regions_raw = list(block.get("task_region", []) or [])
+        task_priority_raw = list(block.get("task_priority", []) or [])
         task_costs_raw = list(block.get("task_cost", []) or [])
+        task_descriptions_raw = list(block.get("task_description", []) or [])
         item_prereqs_raw = list(block.get("item_prereqs", block.get("reward_prereqs", [])) or [])
         task_count_raw = block.get("task_count", None)
 
@@ -2353,11 +2981,13 @@ class TaskipelagoApp(tk.Tk):
                 task_counts.append(c)
             prereqs = [_str(prereqs_raw[i]) if i < len(prereqs_raw) else "" for i in range(len(tasks))]
             task_regions = [_str(task_regions_raw[i]) if i < len(task_regions_raw) else "" for i in range(len(tasks))]
+            task_priority = [_str(task_priority_raw[i]).lower() == "true" if i < len(task_priority_raw) else False for i in range(len(tasks))]
             task_costs = [_str(task_costs_raw[i]) if i < len(task_costs_raw) else "" for i in range(len(tasks))]
+            task_descriptions = [_str(task_descriptions_raw[i]) if i < len(task_descriptions_raw) else "" for i in range(len(tasks))]
             item_prereqs = [_str(item_prereqs_raw[i]) if i < len(item_prereqs_raw) else "" for i in range(len(tasks))]
         else:
             # Crunch consecutive identical task names into single rows with count
-            tasks, prereqs, task_regions, task_costs, item_prereqs, task_counts = [], [], [], [], [], []
+            tasks, prereqs, task_regions, task_priority, task_costs, task_descriptions, item_prereqs, task_counts = [], [], [], [], [], [], [], []
             i = 0
             while i < len(tasks_raw):
                 name = _str(tasks_raw[i])
@@ -2369,7 +2999,9 @@ class TaskipelagoApp(tk.Tk):
                 tasks.append(name)
                 prereqs.append(_str(prereqs_raw[i]) if i < len(prereqs_raw) else "")
                 task_regions.append(_str(task_regions_raw[i]) if i < len(task_regions_raw) else "")
+                task_priority.append(_str(task_priority_raw[i]).lower() == "true" if i < len(task_priority_raw) else False)
                 task_costs.append(_str(task_costs_raw[i]) if i < len(task_costs_raw) else "")
+                task_descriptions.append(_str(task_descriptions_raw[i]) if i < len(task_descriptions_raw) else "")
                 item_prereqs.append(_str(item_prereqs_raw[i]) if i < len(item_prereqs_raw) else "")
                 task_counts.append(count)
                 i = j
@@ -2379,18 +3011,51 @@ class TaskipelagoApp(tk.Tk):
         # --------- Crunch or parse item counts ---------
         if item_count_raw is not None:
             item_count_list = [item_count_raw] if not isinstance(item_count_raw, list) else list(item_count_raw)
-            items = [_str(t) for t in items_raw]
-            item_types = [_str(item_types_raw[i], "useful") if i < len(item_types_raw) else "useful" for i in range(len(items))]
-            item_fillers = [item_fillers_raw[i] if i < len(item_fillers_raw) else None for i in range(len(items))]
-            item_prog_groups = [_str(item_prog_group_raw[i]) if i < len(item_prog_group_raw) else "" for i in range(len(items))]
-            item_consumables = [_str(item_consumable_raw[i]).lower() == "true" if i < len(item_consumable_raw) else False for i in range(len(items))]
-            item_counts = []
-            for i in range(len(items)):
+            _items_flat = [_str(t) for t in items_raw]
+            _types_flat = [_str(item_types_raw[i], "useful") if i < len(item_types_raw) else "useful" for i in range(len(_items_flat))]
+            _fillers_flat = [item_fillers_raw[i] if i < len(item_fillers_raw) else None for i in range(len(_items_flat))]
+            _pgroups_flat = [_str(item_prog_group_raw[i]) if i < len(item_prog_group_raw) else "" for i in range(len(_items_flat))]
+            _cons_flat = [_str(item_consumable_raw[i]).lower() == "true" if i < len(item_consumable_raw) else False for i in range(len(_items_flat))]
+            _counts_flat = []
+            for i in range(len(_items_flat)):
                 try:
                     c = max(1, int(item_count_list[i])) if i < len(item_count_list) else 1
                 except (ValueError, TypeError):
                     c = 1
-                item_counts.append(c)
+                _counts_flat.append(c)
+
+            # Collapse consecutive filler entries (from expanded export) into one row
+            items, item_types, item_fillers, item_prog_groups, item_consumables, item_counts = [], [], [], [], [], []
+            i = 0
+            while i < len(_items_flat):
+                fi = _fillers_flat[i]
+                is_f = fi is True or (fi is None and _is_filler(_items_flat[i]))
+                if is_f:
+                    total = _counts_flat[i]
+                    j = i + 1
+                    while j < len(_items_flat):
+                        fj = _fillers_flat[j]
+                        is_fj = fj is True or (fj is None and _is_filler(_items_flat[j]))
+                        if is_fj:
+                            total += _counts_flat[j]
+                            j += 1
+                        else:
+                            break
+                    items.append(_items_flat[i])
+                    item_types.append(_types_flat[i])
+                    item_fillers.append(True)
+                    item_prog_groups.append("")
+                    item_consumables.append(False)
+                    item_counts.append(total)
+                    i = j
+                else:
+                    items.append(_items_flat[i])
+                    item_types.append(_types_flat[i])
+                    item_fillers.append(fi)
+                    item_prog_groups.append(_pgroups_flat[i])
+                    item_consumables.append(_cons_flat[i])
+                    item_counts.append(_counts_flat[i])
+                    i += 1
         else:
             # Crunch consecutive identical item names
             items, item_types, item_fillers, item_prog_groups, item_consumables, item_counts = [], [], [], [], [], []
@@ -2429,6 +3094,7 @@ class TaskipelagoApp(tk.Tk):
             task_row = TaskRow(
                 self.tasks_scroll.inner, len(self.task_rows) + 1,
                 self._remove_task_row, list(self.regions),
+                colors=self.colors,
             )
             self.task_rows.append(task_row)
             task_row.count_var.trace_add("write", lambda *_: self._update_item_counter())
@@ -2436,7 +3102,9 @@ class TaskipelagoApp(tk.Tk):
             task_row.prereq_var.set(prereqs[i])
             task_row.item_prereq_var.set(item_prereqs[i])
             task_row.cost_var.set(task_costs[i])
+            task_row.priority_var.set(bool(task_priority[i]))
             task_row.count_var.set(task_counts[i])
+            task_row.desc_var.set(task_descriptions[i])
             if task_regions[i] in self.regions:
                 task_row.region_var.set(task_regions[i])
 
@@ -2502,7 +3170,88 @@ class TaskipelagoApp(tk.Tk):
             row.weight_var.set(wtxt)
 
         self._update_item_counter()
-        messagebox.showinfo("Imported", f"Imported YAML from:\n{path}")
+        return True
+
+    def _open_community_yamls(self):
+        win = tk.Toplevel(self)
+        win.title("Community YAMLs")
+        win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
+        win.grab_set()
+
+        status_var = tk.StringVar(value="Loading community YAML list...")
+        ttk.Label(win, textvariable=status_var).pack(padx=16, pady=16)
+
+        def on_loaded(entries=None, error=None):
+            for w in win.winfo_children():
+                w.destroy()
+
+            if error is not None:
+                ttk.Label(win, text=f"Failed to load community YAML list:\n{error}").pack(padx=16, pady=16)
+                ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+                return
+
+            if not entries:
+                ttk.Label(win, text="No community YAMLs found.").pack(padx=16, pady=16)
+                ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+                return
+
+            table = ttk.Frame(win)
+            table.pack(padx=16, pady=12)
+
+            header_font = ("TkDefaultFont", 9, "bold")
+            ttk.Label(table, text="Slot Name", font=header_font).grid(row=0, column=0, sticky="w", padx=(0, 20))
+            ttk.Label(table, text="Author", font=header_font).grid(row=0, column=1, sticky="w", padx=(0, 20))
+            ttk.Label(table, text="Taskipelago Version", font=header_font).grid(row=0, column=2, sticky="e", padx=(0, 20))
+
+            for i, entry in enumerate(entries, start=1):
+                ttk.Label(table, text=entry["slot"]).grid(row=i, column=0, sticky="w", padx=(0, 20), pady=2)
+                ttk.Label(table, text=entry["author"]).grid(row=i, column=1, sticky="w", padx=(0, 20), pady=2)
+                ttk.Label(table, text=entry["version"]).grid(row=i, column=2, sticky="e", padx=(0, 20), pady=2)
+                ttk.Button(
+                    table, text="Import YAML",
+                    command=lambda e=entry: self._import_community_yaml(win, e)
+                ).grid(row=i, column=3, sticky="e", pady=2)
+
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 12))
+
+        def worker():
+            try:
+                entries = _fetch_community_yaml_entries()
+            except Exception as e:
+                self.after(0, lambda: on_loaded(error=e))
+                return
+            self.after(0, lambda: on_loaded(entries=entries))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_community_yaml(self, list_win, entry):
+        status_win = tk.Toplevel(self)
+        status_win.title("Importing...")
+        status_win.resizable(False, False)
+        status_win.configure(bg=self.colors.get("bg", "#1e1e1e"))
+        status_win.grab_set()
+        ttk.Label(status_win, text=f"Downloading {entry['filename']}...").pack(padx=16, pady=16)
+
+        def finish(doc=None, error=None):
+            status_win.destroy()
+            if error is not None:
+                messagebox.showerror("Error", f"Failed to import community YAML:\n{error}")
+                return
+            if self._populate_from_taskipelago_doc(doc):
+                list_win.destroy()
+                messagebox.showinfo("Imported", f"Imported YAML from community file:\n{entry['filename']}")
+
+        def worker():
+            try:
+                text = _download_community_yaml_text(entry["file_id"])
+                doc = yaml.safe_load(text)
+            except Exception as e:
+                self.after(0, lambda: finish(error=e))
+                return
+            self.after(0, lambda: finish(doc=doc))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reset_yaml_generator(self):
         self.player_name_var.set("")
@@ -2512,6 +3261,7 @@ class TaskipelagoApp(tk.Tk):
         self.deathlink_amnesty_var.set(0)
         self.lock_prereqs_var.set(True)
         self.hide_unreachable_tasks.set(True)
+        self.task_reward_previews_var.set(TASK_REWARD_PREVIEW_LABELS[0])
         self.goal_tasks_var.set("")
 
         self.prog_groups = []
@@ -2519,6 +3269,9 @@ class TaskipelagoApp(tk.Tk):
 
         self.regions = []
         self.region_default_pcts = {}
+        self.region_colors = {}
+        self.region_prereqs = {}
+        self._next_color_idx = 0
         self._refresh_regions_panel()
 
         self._clear_task_rows()
@@ -2553,7 +3306,7 @@ class TaskipelagoApp(tk.Tk):
             ),
             (
                 "Tasks -- What They Are",
-                "The Tasks section (top portion of the generator) is the heart of your game.\n\n"
+                "The Tasks section is the heart of your game.\n\n"
                 "Each task you add becomes a location in the multiworld -- a place where an item can "
                 "be hidden. When you complete that task in real life and check it off in the app, you "
                 "\"find\" whatever item was placed there for one of your teammates.\n\n"
@@ -2572,9 +3325,11 @@ class TaskipelagoApp(tk.Tk):
                 "When checked, tasks whose prerequisites are not yet met are hidden from the play "
                 "screen, keeping it clean and focused on what is currently available.\n\n"
                 "\"Goal task(s)\"\n"
-                "The task or tasks that win the game for you when completed. Enter a task number "
-                "(e.g. 5), a quoted task name (e.g. \"Finish the project\"), or multiple separated "
-                "by commas. Leave blank to require ALL tasks to be completed."
+                "The task or tasks that win the game for you when completed. Uses the same "
+                "expression syntax as Task Prereqs: a task number (e.g. 5), a quoted task name "
+                "(e.g. \"Finish the project\"), &&/||/() boolean logic, and region references "
+                "(covered later) -- except the 'prev'/'sequential' keywords, which only work in "
+                "Task Prereqs. Leave blank to require ALL tasks to be completed."
             ),
             (
                 "Task Dependencies (Task Prereqs column)",
@@ -2592,6 +3347,10 @@ class TaskipelagoApp(tk.Tk):
                 "  chores            region's default percentage of tasks done\n"
                 "  chores-75         exactly 75% of that region's tasks done\n"
                 "  chores*5          exactly 5 tasks in that region done\n\n"
+                "Two reserved keywords are also available here (Task Prereqs only):\n"
+                "  prev                    the task immediately before this one\n"
+                "  sequential && \"Chore\"   with Count > 1 (see the Task Count step), chains\n"
+                "                          each duplicate to the one before it\n\n"
                 "Hover over the \"Task prereqs\" column header for a quick reference."
             ),
             (
@@ -2627,14 +3386,25 @@ class TaskipelagoApp(tk.Tk):
             ),
             (
                 "Regions",
-                "Regions let you group related tasks together under a shared label.\n\n"
+                "Regions let you group related tasks together under a shared label and color.\n\n"
+                "The Regions section sits above Tasks in the generator. Expand it to manage your regions.\n\n"
                 "Creating a region:\n"
-                "In the Regions panel (inside the Tasks section), type a name in \"New region "
-                "name\" and click \"Add Region\". Names can only use letters, underscores, and "
-                "hyphens -- no spaces or digits.\n\n"
+                "Type a name in \"New region name\", optionally set a Default %, and click "
+                "\"Add Region\". Names can only use letters, underscores, and hyphens -- no "
+                "spaces or digits.\n\n"
+                "Editing a region:\n"
+                "Each region appears as a row. Click the name field to rename it inline. "
+                "Click the % field to change the default completion percentage. Press Enter "
+                "or click away to confirm changes.\n\n"
+                "Region colors:\n"
+                "Each new region is automatically assigned a color from a preset palette. "
+                "Click the color swatch on the left of any region row to open the color picker "
+                "and choose a different color. In the play view, tasks belonging to a region "
+                "show a colored bar on their left edge, and a collapsible Regions panel above "
+                "the task list shows a progress bar for each region.\n\n"
                 "Default %:\n"
-                "When another task references this region without a specific number, this is the "
-                "percentage of the region's tasks that must be done. Default is 100%.\n\n"
+                "When a task prereq references this region without an explicit number, this "
+                "percentage of the region's tasks must be complete. Default is 100%.\n\n"
                 "Assigning tasks to a region:\n"
                 "Use the \"Region\" column in the task table to assign each task to a region.\n\n"
                 "Referencing a region in Task Prereqs:\n"
@@ -2651,8 +3421,21 @@ class TaskipelagoApp(tk.Tk):
                 "to the game -- each one is its own location with its own hidden item.\n\n"
                 "If another task has this task in its prerequisites, ALL copies must be completed "
                 "before that other task unlocks.\n\n"
+                "Add 'sequential' to this task's own prereqs (e.g. sequential && \"Chore\") to chain "
+                "the copies in order instead: the first copy only needs \"Chore\", but each copy "
+                "after that also requires the copy before it to be completed first.\n\n"
                 "When you import a YAML file, consecutive duplicate task rows are automatically "
                 "collapsed back into a single row with the correct count."
+            ),
+            (
+                "Task Priority (Priority column)",
+                "The \"Priority\" checkbox in the task table marks a task's reward location as an "
+                "Archipelago priority location.\n\n"
+                "Archipelago will try to place a progression or otherwise important item there "
+                "instead of junk/filler -- useful for guaranteeing an early, impactful pickup on "
+                "a task you expect to complete quickly.\n\n"
+                "This uses Archipelago's built-in priority_locations mechanism directly, so it "
+                "works the same way it does for every other game."
             ),
             (
                 "Items -- What They Are",
@@ -2796,6 +3579,7 @@ class TaskipelagoApp(tk.Tk):
         win.title("YAML Generator Tutorial")
         win.resizable(True, True)
         win.minsize(440, 360)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
 
         self.update_idletasks()
         mx = self.winfo_rootx() + self.winfo_width() + 12
@@ -2927,6 +3711,7 @@ class TaskipelagoApp(tk.Tk):
         self.pending_reward_locations = set()
         self._task_purchases = {}
         self._manual_consumptions = {}
+        self._hint_requested_indices = set()
         if hasattr(self, "_local_enforce_var"):
             self._local_enforce_var.set(False)
         if hasattr(self, "_show_locked_var"):
@@ -2955,12 +3740,17 @@ class TaskipelagoApp(tk.Tk):
             self.ctx.task_progressive_reqs = []
             self.ctx.regions = []
             self.ctx.region_default_pcts = {}
+            self.ctx.region_colors = []
             self.ctx.task_region = []
             self.ctx.task_region_reqs = []
+            self.ctx.task_descriptions = []
             self.ctx.bingo_mode = False
             self.ctx.bingo_dimension_x = 5
             self.ctx.bingo_dimension_y = 5
             self.ctx.bingoal = 3
+            for attr in ("items_received", "received_items"):
+                if hasattr(self.ctx, attr) and isinstance(getattr(self.ctx, attr), list):
+                    getattr(self.ctx, attr).clear()
         self.refresh_play_tab()
 
     # ---------------- Notifications stuff ----------------
@@ -3083,7 +3873,7 @@ class TaskipelagoApp(tk.Tk):
         else:
             self.send_deathlink_btn.pack_forget()
 
-    def _build_task_card(self, parent: tk.Widget, task_idx: int) -> dict:
+    def _build_task_card(self, parent: tk.Widget, task_idx: int, bar_color: str = "") -> dict:
         panel = self.colors.get("panel", "#252526")
         border = self.colors.get("border", "#3a3a3a")
         fg = self.colors.get("fg", "#e6e6e6")
@@ -3091,8 +3881,15 @@ class TaskipelagoApp(tk.Tk):
 
         card = tk.Frame(parent, bg=panel, highlightbackground=border, highlightthickness=1)
 
-        top = tk.Frame(card, bg=panel)
-        top.pack(fill="x", padx=10, pady=(8, 2))
+        bar = tk.Frame(card, width=4, bg=bar_color if bar_color else panel)
+        bar.pack(side="left", fill="y")
+        bar.pack_propagate(False)
+
+        content = tk.Frame(card, bg=panel)
+        content.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(content, bg=panel)
+        top.pack(fill="x", padx=(6, 10), pady=(8, 2))
 
         label = tk.Label(
             top, text="", bg=panel, fg=fg,
@@ -3105,7 +3902,7 @@ class TaskipelagoApp(tk.Tk):
             command=lambda idx=task_idx: self.complete_task(idx),
         )
         purchase_btn = ttk.Button(
-            top, text="Purchase",
+            top, text="$$ Purchase $$",
             command=lambda idx=task_idx: self._attempt_purchase(idx),
         )
         mc_btn = ttk.Button(
@@ -3113,19 +3910,31 @@ class TaskipelagoApp(tk.Tk):
             command=lambda idx=task_idx: self._attempt_make_change(idx),
         )
 
+        reward_preview_label = tk.Label(
+            top, text="", bg=panel, fg=muted,
+            font=("Segoe UI", 11, "italic"), anchor="e", justify="right",
+        )
+
+        desc_label = tk.Label(
+            content, text="", bg=panel, fg=self.colors.get("desc", "#d4d4d4"),
+            font=("Segoe UI", 10), anchor="w", justify="left", wraplength=740,
+        )
+
         hints = [
-            tk.Label(card, text="", bg=panel, fg=muted,
+            tk.Label(content, text="", bg=panel, fg=muted,
                      font=("Segoe UI", 10), anchor="w", justify="left", wraplength=740)
             for _ in range(4)
         ]
-        spacer = tk.Frame(card, bg=panel, height=6)
+        spacer = tk.Frame(content, bg=panel, height=6)
 
         return {
             "frame": card,
             "label": label,
+            "desc_label": desc_label,
             "complete_btn": complete_btn,
             "purchase_btn": purchase_btn,
             "make_change_btn": mc_btn,
+            "reward_preview_label": reward_preview_label,
             "hints": hints,
             "spacer": spacer,
             "sig": (),
@@ -3133,14 +3942,25 @@ class TaskipelagoApp(tk.Tk):
 
     def _apply_task_card_state(self, card_dict: dict, s: dict) -> None:
         card_dict["label"].config(text=s["label_text"], fg=s["label_color"])
+        card_dict["reward_preview_label"].config(text=s.get("reward_preview_text", ""))
+
+        desc_label = card_dict["desc_label"]
+        desc_text = s.get("description", "")
+        if desc_text:
+            desc_label.config(text=desc_text)
+            desc_label.pack(fill="x", padx=28, pady=(0, 2))
+        else:
+            desc_label.pack_forget()
 
         complete_btn = card_dict["complete_btn"]
         purchase_btn = card_dict["purchase_btn"]
         mc_btn = card_dict["make_change_btn"]
+        reward_preview_label = card_dict["reward_preview_label"]
 
         complete_btn.pack_forget()
         purchase_btn.pack_forget()
         mc_btn.pack_forget()
+        reward_preview_label.pack_forget()
 
         if s["completed"]:
             if s["can_make_change"]:
@@ -3153,6 +3973,8 @@ class TaskipelagoApp(tk.Tk):
             else:
                 complete_btn.state(["disabled"])
             complete_btn.pack(side="right", padx=(10, 0))
+            if s.get("reward_preview_text"):
+                reward_preview_label.pack(side="right", padx=(10, 0))
             if s["can_make_change"]:
                 mc_btn.pack(side="right", padx=(10, 0))
 
@@ -3172,6 +3994,81 @@ class TaskipelagoApp(tk.Tk):
             card_dict["spacer"].pack(fill="x")
 
         card_dict["sig"] = s["sig"]
+
+    def _toggle_region_progress(self):
+        self._region_progress_expanded = not self._region_progress_expanded
+        if self._region_progress_expanded:
+            self._region_progress_toggle_btn.configure(text="[-] Regions")
+            self._region_progress_inner.pack(fill="x", padx=6, pady=(0, 4))
+        else:
+            self._region_progress_toggle_btn.configure(text="[+] Regions")
+            self._region_progress_inner.pack_forget()
+
+    def _refresh_region_progress(self):
+        for w in self._region_progress_inner.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        regions = list(getattr(self.ctx, "regions", []) or []) if getattr(self, "ctx", None) else []
+        if not regions:
+            self._region_progress_outer.pack_forget()
+            return
+
+        self._region_progress_outer.pack(fill="x", before=self.play_tasks_scroll)
+
+        if not self._region_progress_expanded:
+            return
+
+        colors_list = list(getattr(self.ctx, "region_colors", []) or [])
+        task_region = list(getattr(self.ctx, "task_region", []) or [])
+        checked = set(getattr(self.ctx, "checked_locations_set", set()) or set())
+        base_complete = getattr(self.ctx, "base_complete_location_id", None)
+
+        bg = self.colors.get("bg", "#1e1e1e")
+        border = self.colors.get("border", "#3a3a3a")
+        fg = self.colors.get("fg", "#e6e6e6")
+        muted = self.colors.get("muted", "#bdbdbd")
+
+        for ri, rname in enumerate(regions):
+            color = colors_list[ri] if ri < len(colors_list) and colors_list[ri] else "#808080"
+            indices = [i for i, r in enumerate(task_region) if r == rname]
+            total = len(indices)
+            if base_complete is not None:
+                done = sum(1 for i in indices if (base_complete + i) in checked)
+            else:
+                done = 0
+            pct = done / total if total > 0 else 0
+
+            row = tk.Frame(self._region_progress_inner, bg=bg)
+            row.pack(fill="x", pady=1)
+
+            name_lbl = tk.Label(row, text=rname, bg=bg, fg=fg,
+                                width=14, anchor="w", font=("Segoe UI", 10))
+            name_lbl.pack(side="left", padx=(2, 6))
+
+            bar_outer = tk.Frame(row, bg=border, height=12)
+            bar_outer.pack(side="left", fill="x", expand=True, pady=3)
+            bar_outer.pack_propagate(False)
+
+            bar_canvas = tk.Canvas(bar_outer, bg=border, highlightthickness=0)
+            bar_canvas.pack(fill="both", expand=True)
+
+            def _draw(event, canvas=bar_canvas, p=pct, c=color, bc=border):
+                canvas.delete("all")
+                w = event.width
+                h = event.height
+                fill_w = max(0, int(w * p))
+                if fill_w > 0:
+                    canvas.create_rectangle(0, 0, fill_w, h, fill=c, outline="")
+                if fill_w < w:
+                    canvas.create_rectangle(fill_w, 0, w, h, fill=bc, outline="")
+            bar_canvas.bind("<Configure>", _draw)
+
+            count_lbl = tk.Label(row, text=f"{done}/{total}", bg=bg, fg=muted,
+                                 width=6, anchor="e", font=("Segoe UI", 10))
+            count_lbl.pack(side="left", padx=(6, 4))
 
     def refresh_play_tab(self):
         self._refresh_after_id = None
@@ -3214,12 +4111,14 @@ class TaskipelagoApp(tk.Tk):
 
         if not connected:
             _clear_task_cards()
+            self._region_progress_outer.pack_forget()
             self.play_bingo_frame.pack_forget()
             self.play_tasks_scroll.pack(fill="both", expand=True, padx=10, pady=10)
             return
 
         if bingo_mode:
             _clear_task_cards()
+            self._region_progress_outer.pack_forget()
             self.play_tasks_scroll.pack_forget()
             self.play_bingo_frame.pack(fill="both", expand=True, padx=10, pady=10)
             self._render_bingo_board()
@@ -3228,16 +4127,32 @@ class TaskipelagoApp(tk.Tk):
             self.play_bingo_frame.pack_forget()
             self.play_tasks_scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
+        self._refresh_region_progress()
+
         fg = self.colors.get("fg", "#e6e6e6")
         muted = self.colors.get("muted", "#bdbdbd")
 
         checked = set(getattr(self.ctx, "checked_locations_set", set()) or set())
         prereq_list = list(getattr(self.ctx, "task_prereqs", []) or [])
         item_prereq_list = list(getattr(self.ctx, "item_prereqs", []) or [])
+        task_reward_previews_mode = int(getattr(self.ctx, "task_reward_previews", 0) or 0)
+        sent_item_names = list(getattr(self.ctx, "sent_item_names", []) or [])
+        sent_player_names = list(getattr(self.ctx, "sent_player_names", []) or [])
+        _hint_scout_locations: list = []
         effective_lock = yaml_lock or self._local_enforce_var.get()
         show_locked = self._show_locked_var.get()
         hide_completed = self._hide_completed_var.get()
         cost_amounts = list(getattr(self.ctx, "task_cost_amounts", []) or [])
+
+        _ctx_regions = list(getattr(self.ctx, "regions", []) or [])
+        _ctx_region_colors = list(getattr(self.ctx, "region_colors", []) or [])
+        _region_color_map = {
+            _ctx_regions[i]: _ctx_region_colors[i]
+            for i in range(min(len(_ctx_regions), len(_ctx_region_colors)))
+            if _ctx_region_colors[i]
+        }
+        _task_region_list = list(getattr(self.ctx, "task_region", []) or [])
+        _task_desc_list = list(getattr(self.ctx, "task_descriptions", []) or [])
 
         new_visible: list = []  # [(task_idx, s_dict), ...]
 
@@ -3351,7 +4266,31 @@ class TaskipelagoApp(tk.Tk):
             can_complete = not (effective_lock and (not other_prereqs_ok or not cost_paid))
             show_purchase = cost_only_locked and effective_lock
 
-            sig = (label_text, label_color, can_complete, show_purchase, can_make_change, *hint_texts)
+            task_region_name = _task_region_list[i] if i < len(_task_region_list) else ""
+            bar_color = _region_color_map.get(task_region_name, "") if task_region_name else ""
+
+            description = _task_desc_list[i] if i < len(_task_desc_list) else ""
+            description = description if (description and not show_as_locked) else ""
+
+            is_available = can_complete and not completed and not show_purchase
+
+            reward_preview_text = ""
+            if is_available and task_reward_previews_mode != 0:
+                r_name = str(sent_item_names[i]).strip() if i < len(sent_item_names) else ""
+                r_player = (str(sent_player_names[i]).strip() if i < len(sent_player_names) else "") or "Unknown"
+                if r_name:
+                    reward_preview_text = f"{r_name} → {r_player}"
+
+            if (
+                is_available
+                and task_reward_previews_mode == 2
+                and i not in self._hint_requested_indices
+            ):
+                self._hint_requested_indices.add(i)
+                _hint_scout_locations.append(self.ctx.base_reward_location_id + i)
+
+            sig = (label_text, label_color, can_complete, show_purchase, can_make_change,
+                   description, reward_preview_text, *hint_texts)
             new_visible.append((i, {
                 "label_text": label_text,
                 "label_color": label_color,
@@ -3360,8 +4299,23 @@ class TaskipelagoApp(tk.Tk):
                 "show_purchase": show_purchase,
                 "can_make_change": can_make_change,
                 "hint_texts": hint_texts,
+                "description": description,
+                "reward_preview_text": reward_preview_text,
+                "bar_color": bar_color,
                 "sig": sig,
             }))
+
+        if _hint_scout_locations:
+            locs = list(_hint_scout_locations)
+
+            async def _send_reward_hints(locs=locs):
+                await self.ctx.send_msgs([{
+                    "cmd": "LocationScouts",
+                    "locations": locs,
+                    "create_as_hint": 1,
+                }])
+
+            self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_send_reward_hints()))
 
         new_visible_indices = [idx for idx, _ in new_visible]
         new_visible_set = set(new_visible_indices)
@@ -3379,7 +4333,7 @@ class TaskipelagoApp(tk.Tk):
         for task_idx, s in new_visible:
             if task_idx not in self._task_cards:
                 self._task_cards[task_idx] = self._build_task_card(
-                    self.play_tasks_scroll.inner, task_idx
+                    self.play_tasks_scroll.inner, task_idx, bar_color=s.get("bar_color", "")
                 )
             card_dict = self._task_cards[task_idx]
             if card_dict["sig"] != s["sig"]:
@@ -3785,6 +4739,7 @@ class TaskipelagoApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Choose Payment")
         win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         win.grab_set()
 
         ttk.Label(win, text="Choose how to pay for this task:").pack(padx=16, pady=(12, 4))
@@ -3856,6 +4811,7 @@ class TaskipelagoApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Make Change")
         win.resizable(False, False)
+        win.configure(bg=self.colors.get("bg", "#1e1e1e"))
         win.grab_set()
 
         ttk.Label(win, text=f"Currently paid: {current_label}").pack(padx=16, pady=(12, 2))
@@ -4109,6 +5065,7 @@ class TaskipelagoApp(tk.Tk):
 
         ttk.Label(meta, text="Player Name:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
         self.bingo_player_var = tk.StringVar()
+        _limit_var_length(self.bingo_player_var, MAX_PLAYER_NAME_LEN)
         ttk.Entry(meta, textvariable=self.bingo_player_var).grid(
             row=0, column=1, sticky="ew", padx=(0, 10), pady=8
         )
@@ -4118,27 +5075,27 @@ class TaskipelagoApp(tk.Tk):
 
         ttk.Label(settings_row, text="Columns (X):").grid(row=0, column=0, sticky="w")
         self.bingo_x_var = tk.IntVar(value=5)
-        ttk.Spinbox(settings_row, from_=1, to=20, textvariable=self.bingo_x_var, width=4).grid(
+        NoScrollSpinbox(settings_row, from_=1, to=20, textvariable=self.bingo_x_var, width=4).grid(
             row=0, column=1, padx=(4, 16), sticky="w"
         )
         self.bingo_x_var.trace_add("write", lambda *_: self._update_bingo_counts())
 
         ttk.Label(settings_row, text="Rows (Y):").grid(row=0, column=2, sticky="w")
         self.bingo_y_var = tk.IntVar(value=5)
-        ttk.Spinbox(settings_row, from_=1, to=20, textvariable=self.bingo_y_var, width=4).grid(
+        NoScrollSpinbox(settings_row, from_=1, to=20, textvariable=self.bingo_y_var, width=4).grid(
             row=0, column=3, padx=(4, 16), sticky="w"
         )
         self.bingo_y_var.trace_add("write", lambda *_: self._update_bingo_counts())
 
         ttk.Label(settings_row, text="Bingos to goal:").grid(row=0, column=4, sticky="w")
         self.bingo_goal_var = tk.IntVar(value=3)
-        ttk.Spinbox(settings_row, from_=1, to=100, textvariable=self.bingo_goal_var, width=4).grid(
+        NoScrollSpinbox(settings_row, from_=1, to=100, textvariable=self.bingo_goal_var, width=4).grid(
             row=0, column=5, padx=(4, 16), sticky="w"
         )
 
         ttk.Label(settings_row, text="Prog. Balancing:").grid(row=0, column=6, sticky="w")
         self.bingo_prog_var = tk.IntVar(value=50)
-        ttk.Spinbox(settings_row, from_=0, to=99, textvariable=self.bingo_prog_var, width=5).grid(
+        NoScrollSpinbox(settings_row, from_=0, to=99, textvariable=self.bingo_prog_var, width=5).grid(
             row=0, column=7, padx=(4, 16), sticky="w"
         )
 
@@ -4215,7 +5172,7 @@ class TaskipelagoApp(tk.Tk):
         )
         ttk.Label(dl_top, text="Amnesty:").pack(side="left", padx=(20, 4))
         self.bingo_deathlink_amnesty_var = tk.IntVar(value=0)
-        ttk.Spinbox(dl_top, from_=0, to=999, textvariable=self.bingo_deathlink_amnesty_var, width=5).pack(
+        NoScrollSpinbox(dl_top, from_=0, to=999, textvariable=self.bingo_deathlink_amnesty_var, width=5).pack(
             side="left"
         )
 
@@ -4310,15 +5267,17 @@ class TaskipelagoApp(tk.Tk):
             )
             return
 
-        selected = random.sample(spaces_pool, n_spaces)
+        selected = _dedupe_names(random.sample(spaces_pool, n_spaces))
 
         tasks, rewards, task_prereqs, reward_prereqs, reward_types = [], [], [], [], []
+        item_fillers: list = []
         middle = n_spaces // 2
 
         for i in range(n_spaces):
             r, c = divmod(i, X)
             tasks.append(selected[i])
             rewards.append(f"Bingo {r + 1},{c + 1} Unlock")
+            item_fillers.append(False)
             task_prereqs.append("")
             reward_prereqs.append("" if i == middle else str(i + 1))
             reward_types.append("progression")
@@ -4343,6 +5302,7 @@ class TaskipelagoApp(tk.Tk):
                 name = "Diagonal Bingo (↙)" if n_anti_diags == 1 else f"Diagonal Bingo (↙ #{idx + 1})"
             tasks.append(name)
             rewards.append(_random_filler())
+            item_fillers.append(True)
             task_prereqs.append(", ".join(str(s + 1) for s in line))
             reward_prereqs.append("")
             reward_types.append("junk")
@@ -4360,7 +5320,8 @@ class TaskipelagoApp(tk.Tk):
                 )
                 return
 
-        # Assign user-provided rewards to filler slots (free space + line tasks)
+        # Assign user-provided rewards to filler slots (free space + line tasks).
+        # Duplicate reward text is allowed here - collapsed into item_count below.
         reward_pool = self._get_bingo_rewards()
         random.shuffle(reward_pool)
         reward_iter = iter(reward_pool)
@@ -4375,9 +5336,21 @@ class TaskipelagoApp(tk.Tk):
             if user_rw:
                 rewards[n_spaces + li] = user_rw
                 reward_types[n_spaces + li] = "useful"
+                item_fillers[n_spaces + li] = False
 
         bingoal = max(1, min(bingoal, L))
         goal_expr = _gen_bingoal_expr(n_spaces, L, bingoal)
+
+        # Collapse reward items sharing name/type/filler into a single row with a count.
+        # item_prereqs references items by editor-row index, which generate_early
+        # translates to final positions via editor_to_yaml_item (a multi-copy row
+        # becomes an OR of all its copies) - row order is preserved by _collapse_items_by_count
+        # (first-seen order), and increasing an earlier row's count never inserts a row
+        # before a later one, so board-cell reward_prereqs references stay valid regardless
+        # of what merges with what.
+        item_names, item_types_out, item_fillers_out, item_counts = _collapse_items_by_count(
+            rewards, reward_types, item_fillers
+        )
 
         data = {
             "name": player_name,
@@ -4388,11 +5361,12 @@ class TaskipelagoApp(tk.Tk):
                 "accessibility": self.bingo_access_var.get(),
                 "death_link": {"true": 50, "false": 0} if self.bingo_deathlink_var.get() else {"true": 0, "false": 50},
                 "progressive_groups": [],
-                "item_progressive_group": [""] * len(tasks),
+                "item_progressive_group": [""] * len(item_names),
                 "tasks": tasks,
-                "items": rewards,
-                "item_types": reward_types,
-                "item_fillers": [False] * len(tasks),
+                "items": item_names,
+                "item_types": item_types_out,
+                "item_fillers": item_fillers_out,
+                "item_count": [str(c) for c in item_counts],
                 "task_prereqs": task_prereqs,
                 "item_prereqs": reward_prereqs,
                 "lock_prereqs": True,
@@ -4538,20 +5512,6 @@ class TaskipelagoApp(tk.Tk):
         self._update_bingo_counts()
         messagebox.showinfo("Loaded", f"Bingo settings loaded from:\n{path}")
 
-    def _import_bingo_yaml(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("YAML Files", "*.yaml *.yml"), ("All Files", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                doc = yaml.safe_load(f)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to read YAML:\n{e}")
-            return
-        self._load_bingo_yaml_doc(doc, path)
-
     def _load_bingo_yaml_doc(self, doc, path: str):
         player_name, block = self._extract_taskipelago_block(doc)
         if not isinstance(block, dict):
@@ -4609,19 +5569,20 @@ class TaskipelagoApp(tk.Tk):
                 self.bingo_spaces_text.insert("end", s + "\n")
 
         rewards = list(block.get("items", block.get("rewards", [])) or [])
-        middle = n_spaces // 2
-        n_lines = len(_bingo_lines(X, Y))
+        item_count_raw = block.get("item_count", None)
+        if item_count_raw is not None:
+            item_count_list = [item_count_raw] if not isinstance(item_count_raw, list) else list(item_count_raw)
+            rewards = _expand_by_count(rewards, item_count_list)
+
+        # Content-based, not position-based: collapsing by item_count can reorder
+        # entries sharing a name/type/filler (e.g. the middle cell's reward landing
+        # on the same text as a line reward), so every non-filler, non-board-unlock
+        # entry anywhere in the expanded list is a real user-supplied reward.
         filler_rewards = []
-        if middle < len(rewards):
-            rw = str(rewards[middle]).strip()
+        for rw in rewards:
+            rw = str(rw).strip()
             if rw and not _is_filler(rw) and not rw.startswith("Bingo "):
                 filler_rewards.append(rw)
-        for li in range(n_lines):
-            idx = n_spaces + li
-            if idx < len(rewards):
-                rw = str(rewards[idx]).strip()
-                if rw and not _is_filler(rw):
-                    filler_rewards.append(rw)
 
         self.bingo_rewards_text.delete("1.0", "end")
         for rw in filler_rewards:
@@ -4758,30 +5719,6 @@ class TaskipelagoApp(tk.Tk):
 
         return ", ".join(names)
         
-    def _slot_name_from_id(self, slot_id):
-        """Best-effort slot-id -> slot name."""
-        if slot_id is None:
-            return "Unknown"
-        try:
-            ctx = getattr(self, "ctx", None)
-            slot_info = getattr(ctx, "slot_info", None) if ctx else None
-
-            # Archipelago commonly provides slot_info as dict[int, dict-like]
-            if isinstance(slot_info, dict) and slot_id in slot_info:
-                v = slot_info.get(slot_id)
-                if isinstance(v, dict):
-                    name = v.get("name") or v.get("slot_name") or v.get("player_name")
-                    if isinstance(name, str) and name.strip():
-                        return name.strip()
-                else:
-                    name = getattr(v, "name", None) or getattr(v, "slot_name", None)
-                    if isinstance(name, str) and name.strip():
-                        return name.strip()
-        except Exception:
-            pass
-
-        return f"Player {slot_id}"
-    
     def _get_sent_notification_info(self, task_index: int):
         ctx = getattr(self, "ctx", None)
         if not ctx:
@@ -4807,193 +5744,6 @@ class TaskipelagoApp(tk.Tk):
             recipient_name = str(sent_player_names[task_index]).strip() or "Unknown"
 
         return item_name, recipient_name
-    
-    def _resolve_location_item_and_player(self, location_id: int):
-        """
-        Resolve (item_id, player_id) for a location using the best available source.
-
-        Order:
-        1) existing local/cache-based lookup
-        2) authoritative ctx.locations_info mapping if available
-        """
-        item_id, player_id = self._get_location_item_and_player(location_id)
-        if item_id is not None and player_id is not None:
-            return item_id, player_id
-
-        ctx = getattr(self, "ctx", None)
-        if not ctx:
-            return item_id, player_id
-
-        try:
-            locations_info = getattr(ctx, "locations_info", None)
-            if locations_info is not None:
-                li = None
-
-                if isinstance(locations_info, dict):
-                    li = locations_info.get(location_id)
-                elif hasattr(locations_info, "get"):
-                    li = locations_info.get(location_id)
-
-                if li is not None:
-                    # tuple/list
-                    if isinstance(li, (tuple, list)) and len(li) >= 2:
-                        item_id = li[0] if item_id is None else item_id
-                        player_id = li[1] if player_id is None else player_id
-                        return item_id, player_id
-
-                    # dict
-                    if isinstance(li, dict):
-                        if item_id is None:
-                            item_id = li.get("item")
-                        if player_id is None:
-                            player_id = li.get("player")
-                        return item_id, player_id
-
-                    # object
-                    if item_id is None:
-                        item_id = getattr(li, "item", None)
-                    if player_id is None:
-                        player_id = getattr(li, "player", None)
-                    return item_id, player_id
-        except Exception:
-            pass
-
-        return item_id, player_id
-    
-    def _resolve_player_name(self, player_id) -> str:
-        ctx = getattr(self, "ctx", None)
-        if ctx is None or player_id is None:
-            return "Unknown"
-
-        # 1) direct player_names map
-        try:
-            player_names = getattr(ctx, "player_names", None)
-            if isinstance(player_names, dict):
-                name = player_names.get(player_id)
-                if name:
-                    return str(name)
-            elif hasattr(player_names, "get"):
-                name = player_names.get(player_id)
-                if name:
-                    return str(name)
-        except Exception:
-            pass
-
-        # 2) slot_info map
-        try:
-            slot_info = getattr(ctx, "slot_info", None)
-            if isinstance(slot_info, dict):
-                info = slot_info.get(player_id)
-            elif hasattr(slot_info, "get"):
-                info = slot_info.get(player_id)
-            else:
-                info = None
-
-            if info is not None:
-                name = getattr(info, "name", None)
-                if name:
-                    return str(name)
-
-                if isinstance(info, dict):
-                    name = info.get("name")
-                    if name:
-                        return str(name)
-        except Exception:
-            pass
-
-        return "Unknown"
-
-    def _get_location_item_and_player(self, loc_id: int):
-        """
-        Best-effort read of scouted location info from context.
-        Returns: (item_id|None, player_id|None)
-        """
-        ctx = getattr(self, "ctx", None)
-        if not ctx:
-            return None, None
-
-        # Different AP clients / versions store this differently.
-        candidates = [
-            "location_info",
-            "locations_info",
-            "locations_info_cache",
-            "location_infos",
-            "scouted_locations",
-        ]
-
-        for attr in candidates:
-            try:
-                m = getattr(ctx, attr, None)
-                if isinstance(m, dict) and loc_id in m:
-                    li = m.get(loc_id)
-
-                    # tuple/list form: (item, player, flags?) or similar
-                    if isinstance(li, (tuple, list)) and len(li) >= 2:
-                        return li[0], li[1]
-
-                    # dict form
-                    if isinstance(li, dict):
-                        return li.get("item"), li.get("player")
-
-                    # object form (NetUtils.LocationInfo-like)
-                    item = getattr(li, "item", None)
-                    player = getattr(li, "player", None)
-                    return item, player
-            except Exception:
-                continue
-
-        return None, None
-
-    def _resolve_item_name_for_sent(self, item_id, task_index: int):
-        """
-        Resolve an item name similar to your received-item popup logic:
-        - Prefer ctx.item_names map (multiworld items)
-        - If it's a Taskipelago Reward item id, use YAML reward text
-        - Otherwise fallback to YAML reward text for this task (best-effort)
-        """
-        ctx = getattr(self, "ctx", None)
-        if not ctx:
-            return None
-
-        resolved = None
-
-        # 1) global item name map
-        try:
-            item_names = getattr(ctx, "item_names", None)
-            if isinstance(item_names, dict):
-                resolved = item_names.get(item_id)
-            elif hasattr(item_names, "get"):
-                resolved = item_names.get(item_id)
-        except Exception:
-            resolved = None
-
-        # 2) Taskipelago item range -> YAML item text
-        try:
-            base_reward_item = getattr(ctx, "base_item_id", None)
-            items_text = list(getattr(ctx, "items", getattr(ctx, "rewards", [])) or [])
-            if isinstance(base_reward_item, int) and isinstance(item_id, int) and items_text:
-                idx = item_id - base_reward_item
-                if 0 <= idx < len(items_text):
-                    resolved = items_text[idx]
-        except Exception:
-            pass
-
-        # 3) fallback: YAML item text by task index (even if item_id unknown)
-        if (not resolved) and task_index is not None:
-            try:
-                items_text = list(getattr(ctx, "items", getattr(ctx, "rewards", [])) or [])
-                if 0 <= task_index < len(items_text):
-                    resolved = items_text[task_index]
-            except Exception:
-                pass
-
-        if resolved is None:
-            return None
-
-        resolved = str(resolved).strip()
-        if not resolved:
-            return None
-        return resolved
 
     def complete_task(self, task_index: int):
         if not getattr(self, "ctx", None):
@@ -5076,6 +5826,13 @@ class TaskipelagoApp(tk.Tk):
                     self.ctx.goal_expression,
                     lambda idx_1: (self.ctx.base_complete_location_id + idx_1 - 1) in checked
                 )
+                for req in (self.ctx.goal_region_reqs or []):
+                    r = req.get("region", "")
+                    abs_count = req.get("abs_count")
+                    if abs_count is not None:
+                        done = done and self._region_req_satisfied_abs(r, abs_count)
+                    else:
+                        done = done and self._region_req_satisfied(r, req.get("pct", 100))
             except Exception:
                 done = False
         else:

@@ -16,6 +16,7 @@ const state = {
   lockPrereqs: false,
   hideUnreachable: true,
   goalExpression: '',
+  goalRegionReqs: [],
   baseRewardId: null,
   baseCompleteId: null,
   baseItemId: null,
@@ -26,15 +27,17 @@ const state = {
   deathLinkEnabled: false,
   sentItemNames: [],
   sentPlayerNames: [],
+  taskRewardPreviews: 0,
   progressiveGroups: [],
   rewardProgressiveGroup: [],
   taskProgressiveReqs: [],
   taskCostAmounts: [],
   itemConsumable: [],
   regions: [],
-  regionDefaultPcts: {},
+  regionColors: [],
   taskRegion: [],
   taskRegionReqs: [],
+  taskDescriptions: [],
   bingoMode: false,
   bingoDimX: 5,
   bingoDimY: 5,
@@ -45,6 +48,7 @@ const state = {
   pendingLocations: new Set(), // optimistic (not yet confirmed by server)
   taskPurchases: {},           // taskIdx -> {name: amount}
   manualConsumptions: {},      // name -> count of manually consumed units
+  hintRequestedIndices: new Set(), // task indices already hinted this session
   notifications: [],           // [{kind, title, body, createdAt}]
   sentGoal: false,
   deathLinkAmnestyLeft: 0,
@@ -431,6 +435,7 @@ function applySlotData(sd) {
   state.lockPrereqs         = !!sd.lock_prereqs;
   state.hideUnreachable     = sd.hide_unreachable_tasks !== false;
   state.goalExpression      = sd.goal_expression || '';
+  state.goalRegionReqs      = sd.goal_region_reqs || [];
   state.baseRewardId        = sd.base_reward_location_id ?? null;
   state.baseCompleteId      = sd.base_complete_location_id ?? null;
   state.baseItemId          = sd.base_item_id ?? null;
@@ -442,15 +447,17 @@ function applySlotData(sd) {
   state.seedName            = sd.seed_name || '';
   state.sentItemNames       = sd.sent_item_names || [];
   state.sentPlayerNames     = sd.sent_player_names || [];
+  state.taskRewardPreviews  = parseInt(sd.task_reward_previews || 0);
   state.progressiveGroups   = sd.progressive_groups || [];
   state.rewardProgressiveGroup = sd.item_progressive_group || sd.reward_progressive_group || [];
   state.taskProgressiveReqs = sd.task_progressive_reqs || [];
   state.taskCostAmounts     = sd.task_cost_amounts || [];
   state.itemConsumable      = sd.item_consumable || [];
   state.regions             = sd.regions || [];
-  state.regionDefaultPcts   = sd.region_default_pcts || {};
+  state.regionColors        = sd.region_colors || [];
   state.taskRegion          = sd.task_region || [];
   state.taskRegionReqs      = sd.task_region_reqs || [];
+  state.taskDescriptions    = sd.task_description || [];
   state.bingoMode           = !!sd.bingo_mode;
   state.bingoDimX           = parseInt(sd.bingo_dimension_x || 5);
   state.bingoDimY           = parseInt(sd.bingo_dimension_y || 5);
@@ -470,6 +477,14 @@ function maybeSendGoal() {
     done = evalPrereqExpr(state.goalExpression, idx1 =>
       checked.has(state.baseCompleteId + idx1 - 1)
     );
+    for (const req of (state.goalRegionReqs || [])) {
+      const r = req.region ?? req[0];
+      const abs = req.abs_count ?? null;
+      const pct = req.pct ?? req[1] ?? 100;
+      done = done && (abs !== null
+        ? regionReqSatisfiedAbs(r, abs, checked)
+        : regionReqSatisfied(r, pct, checked));
+    }
   } else {
     done = state.tasks.every((_, i) => checked.has(state.baseCompleteId + i));
   }
@@ -687,26 +702,57 @@ function startDisconnect() {
 }
 
 function clearPlayState() {
+  // Slot data
+  state.tasks = [];
+  state.items = [];
+  state.taskPrereqs = [];
+  state.itemPrereqs = [];
+  state.lockPrereqs = false;
+  state.hideUnreachable = true;
+  state.goalExpression = '';
+  state.goalRegionReqs = [];
+  state.baseCompleteId = state.baseRewardId = state.baseItemId = state.baseTokenId = null;
+  state.deathLinkPool = [];
+  state.deathLinkWeights = [];
+  state.deathLinkAmnesty = 0;
+  state.deathLinkEnabled = false;
+  state.sentItemNames = [];
+  state.sentPlayerNames = [];
+  state.taskRewardPreviews = 0;
+  state.progressiveGroups = [];
+  state.rewardProgressiveGroup = [];
+  state.taskProgressiveReqs = [];
+  state.taskCostAmounts = [];
+  state.itemConsumable = [];
+  state.regions = [];
+  state.regionColors = [];
+  state.taskRegion = [];
+  state.taskRegionReqs = [];
+  state.taskDescriptions = [];
+  state.bingoMode = false;
+  state.bingoDimX = 5;
+  state.bingoDimY = 5;
+  state.bingoal = 3;
+  // Runtime
+  state.checkedLocations = new Set();
   state.pendingLocations = new Set();
   state.taskPurchases    = {};
   state.manualConsumptions = {};
-  state.sentGoal         = false;
+  state.hintRequestedIndices = new Set();
   state.notifications    = [];
+  state.sentGoal         = false;
+  state.deathLinkAmnestyLeft = 0;
+  state.lastItemIndex    = 0;
+  state.notifyIndexLoaded = false;
+  state.pendingNotifyIndex = null;
+  // UI toggles
   state.localEnforce     = false;
   state.showLocked       = false;
   state.hideCompleted    = false;
   els.enforceCb.checked  = false;
   els.showLockedCb.checked = false;
   els.hideCompletedCb.checked = false;
-  state.tasks = [];
-  state.checkedLocations = new Set();
-  state.baseCompleteId = state.baseRewardId = state.baseItemId = state.baseTokenId = null;
-  state.items = [];
-  state.progressiveGroups = [];
-  state.rewardProgressiveGroup = [];
-  state.itemConsumable = [];
-  state.deathLinkEnabled = false;
-  state.bingoMode = false;
+  // AP client received items
   ap.itemsReceived = [];
 }
 
@@ -888,7 +934,7 @@ function showItemNotification(it) {
 
   // Sender
   let sender = '';
-  if (it.player != null) sender = ap.playerNames[it.player] || `Player ${it.player}`;
+  if (it.player != null) sender = ap.resolvePlayerName(it.player);
 
   enqueueNotification({
     kind:  'reward',
@@ -898,10 +944,80 @@ function showItemNotification(it) {
 }
 
 // =============================================================
+// Region helpers
+// =============================================================
+let regionProgressExpanded = true;
+
+function buildRegionColorMap() {
+  const m = {};
+  for (let i = 0; i < state.regions.length; i++) {
+    const c = state.regionColors[i];
+    if (c) m[state.regions[i]] = c;
+  }
+  return m;
+}
+
+function renderRegionProgress() {
+  const section = $('region-progress-section');
+  if (!section) return;
+  const connected = state.connState === 'connected' && state.regions.length > 0;
+  if (!connected) {
+    section.classList.add('hidden');
+    return;
+  }
+  section.classList.remove('hidden');
+
+  const list = $('region-progress-list');
+  if (!regionProgressExpanded) return;
+
+  const checked = allChecked();
+  const rColors = buildRegionColorMap();
+  const frag = document.createDocumentFragment();
+
+  for (const rname of state.regions) {
+    const color = rColors[rname] || '#808080';
+    const indices = state.taskRegion.map((r, i) => r === rname ? i : -1).filter(i => i >= 0);
+    const total = indices.length;
+    const done = state.baseCompleteId !== null
+      ? indices.filter(i => checked.has(state.baseCompleteId + i)).length
+      : 0;
+    const pct = total > 0 ? done / total : 0;
+
+    const row = document.createElement('div');
+    row.className = 'region-progress-row';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'region-progress-name';
+    nameEl.textContent = rname;
+    row.appendChild(nameEl);
+
+    const barOuter = document.createElement('div');
+    barOuter.className = 'region-progress-bar-outer';
+    const barInner = document.createElement('div');
+    barInner.className = 'region-progress-bar-inner';
+    barInner.style.width = `${Math.round(pct * 100)}%`;
+    barInner.style.backgroundColor = color;
+    barOuter.appendChild(barInner);
+    row.appendChild(barOuter);
+
+    const countEl = document.createElement('span');
+    countEl.className = 'region-progress-count';
+    countEl.textContent = `${done}/${total}`;
+    row.appendChild(countEl);
+
+    frag.appendChild(row);
+  }
+
+  list.innerHTML = '';
+  list.appendChild(frag);
+}
+
+// =============================================================
 // Rendering: all panels
 // =============================================================
 function renderAll() {
   renderTasks();
+  renderRegionProgress();
   renderNotifications();
   renderItems();
   renderConsumables();
@@ -1034,6 +1150,10 @@ function renderTasks() {
 
     const card = document.createElement('div');
     card.className = 'task-card';
+    const _rColors = buildRegionColorMap();
+    const _taskReg = state.taskRegion[i] || '';
+    const _barColor = _taskReg ? (_rColors[_taskReg] || '') : '';
+    card.style.borderLeft = _barColor ? `4px solid ${_barColor}` : '';
 
     const top = document.createElement('div');
     top.className = 'task-top';
@@ -1062,7 +1182,7 @@ function renderTasks() {
       }
     } else if (costOnlyLocked && effectiveLock) {
       const pBtn = document.createElement('button');
-      pBtn.textContent = 'Purchase';
+      pBtn.textContent = '$$ Purchase $$';
       pBtn.onclick = () => attemptPurchase(i);
       actions.appendChild(pBtn);
 
@@ -1074,6 +1194,22 @@ function renderTasks() {
       }
     } else {
       const canComplete = !(effectiveLock && (!otherPrereqsOk || !costPaid));
+
+      if (canComplete && state.taskRewardPreviews !== 0) {
+        const rName = state.sentItemNames[i] || '';
+        const rPlayer = state.sentPlayerNames[i] || 'Unknown';
+        if (rName) {
+          const previewEl = document.createElement('span');
+          previewEl.className = 'task-reward-preview';
+          previewEl.textContent = `${rName} → ${rPlayer}`;
+          top.appendChild(previewEl);
+        }
+        if (state.taskRewardPreviews === 2 && !state.hintRequestedIndices.has(i)) {
+          state.hintRequestedIndices.add(i);
+          ap.sendLocationScouts([state.baseRewardId + i], 1);
+        }
+      }
+
       const cBtn = document.createElement('button');
       cBtn.textContent = 'Complete';
       cBtn.disabled = !canComplete;
@@ -1090,6 +1226,15 @@ function renderTasks() {
 
     top.appendChild(actions);
     card.appendChild(top);
+
+    // Description
+    const descText = !showAsLocked ? (state.taskDescriptions[i] || '') : '';
+    if (descText) {
+      const descEl = document.createElement('div');
+      descEl.className = 'task-description';
+      descEl.textContent = descText;
+      card.appendChild(descEl);
+    }
 
     // Hint lines
     if (!completed && taskPrereqText && !taskPrereqOk) {
@@ -1346,7 +1491,7 @@ function renderItems() {
     }
 
     const sender = it.player != null
-      ? ap.playerNames[it.player] || `Player ${it.player}`
+      ? ap.resolvePlayerName(it.player)
       : null;
 
     const row = document.createElement('div');
@@ -1540,7 +1685,7 @@ function printJsonToHTML(parts, senderSlot) {
     let displayText = part.text || '';
     if (type === 'player_id') {
       const slot = parseInt(displayText);
-      displayText = ap.playerNames[slot] || displayText;
+      displayText = ap.resolvePlayerName(slot) || displayText;
     } else if (type === 'item_id') {
       displayText = resolveItemName(parseInt(displayText));
     } else if (type === 'location_id') {
@@ -1639,6 +1784,23 @@ els.showLockedCb.addEventListener('change', () => {
 els.hideCompletedCb.addEventListener('change', () => {
   state.hideCompleted = els.hideCompletedCb.checked;
   renderTasks();
+});
+
+// =============================================================
+// Region progress toggle
+// =============================================================
+$('region-progress-toggle').addEventListener('click', () => {
+  regionProgressExpanded = !regionProgressExpanded;
+  const list = $('region-progress-list');
+  const btn = $('region-progress-toggle');
+  if (regionProgressExpanded) {
+    list.classList.remove('hidden');
+    btn.textContent = '▼ Regions';
+    renderRegionProgress();
+  } else {
+    list.classList.add('hidden');
+    btn.textContent = '▶ Regions';
+  }
 });
 
 // =============================================================

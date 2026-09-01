@@ -3,12 +3,9 @@ from __future__ import annotations
 import re as _re
 from typing import Any, Dict, List, Tuple
 
-import logging
-
 from BaseClasses import Item, ItemClassification, Region
 from worlds.AutoWorld import WebWorld, World
 
-logger = logging.getLogger("Taskipelago")
 from worlds.LauncherComponents import Component, Type, components, launch_subprocess
 
 from .items import (
@@ -18,6 +15,9 @@ from .items import (
     BASE_TOKEN_ID,
     TaskipelagoItem,
     get_item_classification,
+    build_item_editor_rows,
+    expand_rows,
+    pad_or_trim_names,
 )
 from .locations import (
     LOCATION_NAME_TO_ID,
@@ -25,12 +25,13 @@ from .locations import (
     BASE_REWARD_LOC_ID,
     TaskipelagoLocation,
 )
-from .options import TaskipelagoOptions
+from .options import TaskipelagoOptions, MAX_TASK_DESCRIPTION_LEN
 from .prereq_parser import (
     collect_leaves, collect_group_refs, collect_group_count_refs,
     collect_region_refs, collect_region_abs_refs,
-    collect_cost_groups, collect_cost_groups_per_branch,
+    collect_cost_groups_per_branch,
     eval_node, parse_prereq, parse_cost_expr, resolve_ast_refs, Node,
+    has_seq_flag, ast_to_text, RESERVED_WORDS,
 )
 from .rules import set_rules as _set_rules
 
@@ -83,28 +84,17 @@ class TaskipelagoWorld(World):
     _regions: List[str]
     _region_default_pcts: Dict[str, int]
     _task_region: List[str]
+    _task_descriptions: List[str]
     _task_region_reqs: List[List[dict]]
     _region_to_task_indices: Dict[str, List[int]]
     _region_token_names: Dict[str, List[str]]
+    _region_prereq_text: Dict[str, str]
+    _region_prereq_reqs: Dict[str, List[dict]]
+    _parsed_region_prereqs: Dict[str, Node | None]
     _consumable_groups: Dict[str, List[int]]   # name -> [0-based item indices]
 
     def generate_early(self) -> None:
-        import random as _random
         import sys as _sys
-
-        _FILLER_ITEMS = [
-            "Several pats on the back",
-            "A big thumbs up",
-            "Free dopamine",
-            "One (1) sense of accomplishment",
-            "Mildly increased self-esteem",
-            "A crisp high five",
-            "A firm handshake",
-            "A tiny mental victory parade",
-            "Temporary immunity to self-criticism",
-            "An imaginary star sticker",
-            "A nod of respect",
-        ]
 
         # ------------------------------------------------------------------ #
         # 1. Read raw option lists (pre-expansion, editor-indexed)            #
@@ -112,8 +102,9 @@ class TaskipelagoWorld(World):
         tasks_raw = [str(t).strip() for t in self.options.tasks.value if str(t).strip()]
         items_raw_input = [str(r).strip() for r in self.options.items.value]
 
-        item_types_raw = [str(x).strip().lower() for x in self.options.item_types.value if str(x).strip()]
-        item_consumable_raw = [str(x).strip().lower() for x in (self.options.item_consumable.value or [])]
+        item_types_raw = [str(x).strip() for x in self.options.item_types.value]
+        item_fillers_raw = [str(x).strip() for x in (self.options.item_fillers.value or [])]
+        item_consumable_raw = [str(x).strip() for x in (self.options.item_consumable.value or [])]
         item_count_raw = [str(x).strip() for x in (self.options.item_count.value or [])]
         task_count_raw = [str(x).strip() for x in (self.options.task_count.value or [])]
         task_cost_raw = [str(x).strip() for x in (self.options.task_cost.value or [])]
@@ -136,10 +127,13 @@ class TaskipelagoWorld(World):
 
         _item_name_seen: set = set()
         _item_name_dups: set = set()
-        for _in in items_raw_input:
-            if _in and _in in _item_name_seen:
+        for _i, _in in enumerate(items_raw_input):
+            _is_filler_item = _i < len(item_fillers_raw) and item_fillers_raw[_i].lower() == "true"
+            if not _in or _is_filler_item:
+                continue
+            if _in in _item_name_seen:
                 _item_name_dups.add(_in)
-            elif _in:
+            else:
                 _item_name_seen.add(_in)
         if _item_name_dups:
             raise Exception(
@@ -148,7 +142,7 @@ class TaskipelagoWorld(World):
             )
 
         n_editor_tasks = len(tasks_raw)
-        n_editor_items = len([x for x in items_raw_input if x])
+        n_editor_items = len(items_raw_input)
 
         if n_editor_tasks > MAX_TASKS:
             raise Exception(
@@ -167,34 +161,23 @@ class TaskipelagoWorld(World):
             for i in range(n_editor_tasks)
         ]
 
-        # Pad items_raw_input to editor task count, then normalize
-        allowed_types = {"trap", "junk", "useful", "progression"}
+        _n_yaml_tasks_expected = sum(task_counts_editor)
 
-        # Warn if item/task counts don't match (editor level)
-        if n_editor_items != n_editor_tasks:
+        # Items are an independent editor list from tasks (their own rows/counts);
+        # only the summed totals need to match, so this is built without regard
+        # to n_editor_tasks.
+        items_raw_editor, item_types_editor, item_consumable_editor, item_counts_editor = (
+            build_item_editor_rows(items_raw_input, item_types_raw, item_consumable_raw, item_count_raw)
+        )
+        _n_defined_expanded = sum(item_counts_editor)
+
+        # Warn using expanded counts, not editor slot counts
+        if _n_defined_expanded != _n_yaml_tasks_expected:
             print(
                 f"[Taskipelago] WARNING: Unbalanced item and task counts can lead to generation failures. "
-                f"Tasks: {n_editor_tasks}, Items: {n_editor_items}.",
+                f"Tasks: {_n_yaml_tasks_expected}, Items: {_n_defined_expanded}.",
                 file=_sys.stderr,
             )
-        if len(items_raw_input) < n_editor_tasks:
-            items_raw_input += [_random.choice(_FILLER_ITEMS) for _ in range(n_editor_tasks - len(items_raw_input))]
-        items_raw_input = items_raw_input[:n_editor_tasks]
-        items_raw_editor = [x if x else _random.choice(_FILLER_ITEMS) for x in items_raw_input]
-
-        # Normalize item_types and item_consumable to editor task count
-        if len(item_types_raw) < n_editor_tasks:
-            item_types_raw += ["junk"] * (n_editor_tasks - len(item_types_raw))
-        item_types_editor = [rt if rt in allowed_types else "junk" for rt in item_types_raw[:n_editor_tasks]]
-
-        if len(item_consumable_raw) < n_editor_tasks:
-            item_consumable_raw += ["false"] * (n_editor_tasks - len(item_consumable_raw))
-        item_consumable_editor = [s == "true" for s in item_consumable_raw[:n_editor_tasks]]
-
-        item_counts_editor = [
-            _parse_count(item_count_raw[i] if i < len(item_count_raw) else "")
-            for i in range(n_editor_tasks)
-        ]
 
         # ------------------------------------------------------------------ #
         # 2. Build editor -> YAML index mappings                              #
@@ -223,26 +206,19 @@ class TaskipelagoWorld(World):
         # ------------------------------------------------------------------ #
         # 3. Expand all parallel lists to YAML size                          #
         # ------------------------------------------------------------------ #
-        tasks: List[str] = []
-        items_raw: List[str] = []
-        item_types: List[str] = []
-        item_consumable: List[bool] = []
+        tasks: List[str] = expand_rows(tasks_raw, task_counts_editor)
 
-        for i in range(n_editor_tasks):
-            for _ in range(task_counts_editor[i]):
-                tasks.append(tasks_raw[i])
-            for _ in range(item_counts_editor[i]):
-                items_raw.append(items_raw_editor[i])
-                item_types.append(item_types_editor[i])
-                item_consumable.append(item_consumable_editor[i])
+        items_raw = expand_rows(items_raw_editor, item_counts_editor)
+        item_types = expand_rows(item_types_editor, item_counts_editor)
+        item_consumable = expand_rows(item_consumable_editor, item_counts_editor)
 
         # Pad/trim items to n_yaml_tasks
-        if len(items_raw) < n_yaml_tasks:
-            items_raw += [_random.choice(_FILLER_ITEMS) for _ in range(n_yaml_tasks - len(items_raw))]
+        items_raw = pad_or_trim_names(items_raw, n_yaml_tasks)
+        if len(item_types) < n_yaml_tasks:
             item_types += ["junk"] * (n_yaml_tasks - len(item_types))
-            item_consumable += [False] * (n_yaml_tasks - len(item_consumable))
-        items_raw = items_raw[:n_yaml_tasks]
         item_types = item_types[:n_yaml_tasks]
+        if len(item_consumable) < n_yaml_tasks:
+            item_consumable += [False] * (n_yaml_tasks - len(item_consumable))
         item_consumable = item_consumable[:n_yaml_tasks]
         rewards = list(items_raw)
 
@@ -279,11 +255,30 @@ class TaskipelagoWorld(World):
             task_cost_editor += [""] * (n_editor_tasks - len(task_cost_editor))
         task_cost_editor = task_cost_editor[:n_editor_tasks]
 
+        task_description_editor = [
+            str(x).strip()[:MAX_TASK_DESCRIPTION_LEN] for x in (self.options.task_description.value or [])
+        ]
+        if len(task_description_editor) < n_editor_tasks:
+            task_description_editor += [""] * (n_editor_tasks - len(task_description_editor))
+        task_description_editor = task_description_editor[:n_editor_tasks]
+
+        task_priority_raw = [str(x).strip() for x in (self.options.task_priority.value or [])]
+        task_priority_editor = [
+            (i < len(task_priority_raw) and task_priority_raw[i].lower() == "true")
+            for i in range(n_editor_tasks)
+        ]
+
         # Expand parallel task lists by count, translating indices in prereq strings
         raw_prereqs_input: List[str] = []
         raw_reward_prereqs_input: List[str] = []
         raw_task_region: List[str] = []
+        raw_task_description: List[str] = []
         raw_costs_input: List[str] = []
+        raw_task_priority: List[bool] = []
+        # task_seq_prev_idx[j] = 0-based YAML index of the previous duplicate copy
+        # of the same task, or None if j is the first copy (or count == 1).
+        # Used to resolve the "sequential" keyword at generation time.
+        task_seq_prev_idx: List[int | None] = []
 
         for i in range(n_editor_tasks):
             count = task_counts_editor[i]
@@ -294,11 +289,15 @@ class TaskipelagoWorld(World):
             translated_ip = _translate_prereq_indices(
                 raw_item_prereqs_editor[i], editor_to_yaml_item, and_multi=False
             )
-            for _ in range(count):
+            yaml_idxs = editor_to_yaml_task[i]
+            for c in range(count):
                 raw_prereqs_input.append(translated_tp)
                 raw_reward_prereqs_input.append(translated_ip)
                 raw_task_region.append(task_region_editor[i])
+                raw_task_description.append(task_description_editor[i])
                 raw_costs_input.append(task_cost_editor[i])
+                raw_task_priority.append(task_priority_editor[i])
+                task_seq_prev_idx.append(yaml_idxs[c - 1] if c > 0 else None)
 
         # ------------------------------------------------------------------ #
         # 5. Resolve quoted names in task/item prereqs                       #
@@ -370,6 +369,10 @@ class TaskipelagoWorld(World):
                 raise Exception(
                     f"Taskipelago: region name '{rname}' must not contain digits."
                 )
+            if rname.lower() in RESERVED_WORDS:
+                raise Exception(
+                    f"Taskipelago: region name '{rname}' is a reserved word."
+                )
         if len(raw_regions) != len(set(raw_regions)):
             raise Exception("Taskipelago: duplicate region names.")
         region_set = set(raw_regions)
@@ -392,6 +395,11 @@ class TaskipelagoWorld(World):
                 )
             region_default_pcts[rname] = pct
 
+        raw_rcolors = [str(x).strip() for x in (self.options.region_colors.value or [])]
+        if len(raw_rcolors) < len(raw_regions):
+            raw_rcolors += [""] * (len(raw_regions) - len(raw_rcolors))
+        region_colors = raw_rcolors[:len(raw_regions)]
+
         for i, rname in enumerate(raw_task_region):
             if rname and rname not in region_set:
                 raise Exception(
@@ -405,6 +413,72 @@ class TaskipelagoWorld(World):
                 region_to_task_indices[rname].append(i)
 
         # ------------------------------------------------------------------ #
+        # 7b. Parse region-to-region prereqs                                   #
+        # ------------------------------------------------------------------ #
+        raw_rpr = [str(x).strip() for x in (self.options.region_prereqs.value or [])]
+        if len(raw_rpr) < len(raw_regions):
+            raw_rpr += [""] * (len(raw_regions) - len(raw_rpr))
+        raw_rpr = raw_rpr[:len(raw_regions)]
+        region_prereq_text: Dict[str, str] = dict(zip(raw_regions, raw_rpr))
+
+        region_prereqs_unresolved: Dict[str, Node | None] = {}
+        for rname in raw_regions:
+            ast_r = parse_prereq(
+                region_prereq_text[rname], 0, 0, "region prereq",
+                known_groups=None, known_regions=region_set,
+                location_label=f"region '{rname}'",
+            )
+            region_prereqs_unresolved[rname] = ast_r
+
+        region_prereq_reqs: Dict[str, List[dict]] = {}
+        for rname, ast_r in region_prereqs_unresolved.items():
+            pct_refs = collect_region_refs(ast_r)
+            abs_refs = collect_region_abs_refs(ast_r)
+            reqs: List[dict] = []
+            for dep_name, pct_val in pct_refs:
+                if dep_name == rname:
+                    raise Exception(f"Taskipelago: region '{rname}' cannot depend on itself.")
+                pct = pct_val if pct_val is not None else region_default_pcts.get(dep_name, 100)
+                if pct < 0 or pct > 100:
+                    raise Exception(
+                        f"Taskipelago: region '{rname}' prereq on region '{dep_name}' "
+                        f"percentage {pct} must be 0-100."
+                    )
+                if not region_to_task_indices.get(dep_name):
+                    raise Exception(
+                        f"Taskipelago: region '{rname}' depends on region '{dep_name}' "
+                        f"which has no tasks assigned."
+                    )
+                reqs.append({"region": dep_name, "pct": pct})
+            for dep_name, abs_n in abs_refs:
+                if dep_name == rname:
+                    raise Exception(f"Taskipelago: region '{rname}' cannot depend on itself.")
+                dep_size = len(region_to_task_indices.get(dep_name, []))
+                if dep_size == 0:
+                    raise Exception(
+                        f"Taskipelago: region '{rname}' depends on region '{dep_name}' "
+                        f"which has no tasks assigned."
+                    )
+                if abs_n < 1 or abs_n > dep_size:
+                    raise Exception(
+                        f"Taskipelago: region '{rname}' uses '{dep_name}*{abs_n}' but region "
+                        f"'{dep_name}' only has {dep_size} task(s)."
+                    )
+                reqs.append({"region": dep_name, "abs_count": abs_n})
+            region_prereq_reqs[rname] = reqs
+
+        _assert_no_region_cycles(raw_regions, region_prereq_reqs)
+
+        parsed_region_prereqs: Dict[str, Node | None] = {}
+        for rname, ast_r in region_prereqs_unresolved.items():
+            region_pct = {
+                req["region"]: req["pct"]
+                for req in region_prereq_reqs[rname]
+                if "pct" in req
+            }
+            parsed_region_prereqs[rname] = resolve_ast_refs(ast_r, {}, region_pct)
+
+        # ------------------------------------------------------------------ #
         # 8. Parse progressive groups                                         #
         # ------------------------------------------------------------------ #
         raw_prog_groups = [
@@ -416,20 +490,22 @@ class TaskipelagoWorld(World):
                 raise Exception(
                     f"Taskipelago: progressive group name '{gname}' must not contain digits."
                 )
+            if gname.lower() in RESERVED_WORDS:
+                raise Exception(
+                    f"Taskipelago: progressive group name '{gname}' is a reserved word."
+                )
         if len(raw_prog_groups) != len(set(raw_prog_groups)):
             raise Exception("Taskipelago: duplicate progressive group names.")
         prog_group_set = set(raw_prog_groups)
 
-        # Expand item progressive groups in parallel with items
+        # Expand item progressive groups in parallel with items (own row count,
+        # decoupled from task rows, same as items/item_types/item_consumable).
         raw_ipg_editor = [str(x).strip() for x in (self.options.item_progressive_group.value or [])]
-        if len(raw_ipg_editor) < n_editor_tasks:
-            raw_ipg_editor += [""] * (n_editor_tasks - len(raw_ipg_editor))
-        raw_ipg_editor = raw_ipg_editor[:n_editor_tasks]
+        if len(raw_ipg_editor) < n_editor_items:
+            raw_ipg_editor += [""] * (n_editor_items - len(raw_ipg_editor))
+        raw_ipg_editor = raw_ipg_editor[:n_editor_items]
 
-        raw_rpg: List[str] = []
-        for i in range(n_editor_tasks):
-            for _ in range(item_counts_editor[i]):
-                raw_rpg.append(raw_ipg_editor[i])
+        raw_rpg: List[str] = expand_rows(raw_ipg_editor, item_counts_editor)
         if len(raw_rpg) < n:
             raw_rpg += [""] * (n - len(raw_rpg))
         raw_rpg = raw_rpg[:n]
@@ -568,9 +644,14 @@ class TaskipelagoWorld(World):
         # ------------------------------------------------------------------ #
         parsed_prereqs_unresolved = []
         for i, txt in enumerate(raw_prereqs_input):
-            parsed_prereqs_unresolved.append(
-                parse_prereq(txt, n, i, "task prereq", known_regions=region_set)
-            )
+            ast = parse_prereq(txt, n, i, "task prereq", known_regions=region_set)
+            if ast is not None and has_seq_flag(ast) and task_seq_prev_idx[i] is not None:
+                ast = ("and", [ast, task_seq_prev_idx[i]])
+            # The client-side runtime evaluators don't understand 'prev'/'sequential',
+            # so rewrite their generation-time resolution back into plain text.
+            if ast is not None and (has_seq_flag(ast) or _re.search(r'\bprev\b', txt)):
+                raw_prereqs_input[i] = ast_to_text(ast)
+            parsed_prereqs_unresolved.append(ast)
 
         task_region_reqs: List[List[dict]] = []
         for i, ast in enumerate(parsed_prereqs_unresolved):
@@ -612,15 +693,31 @@ class TaskipelagoWorld(World):
 
         parsed_prereqs = []
         for i, ast in enumerate(parsed_prereqs_unresolved):
-            region_pct = {
+            # Resolve the task's own region refs first, using only its own pct map -
+            # region-level reqs are folded in below AFTER resolution (as an already-resolved
+            # AST), since resolve_ast_refs cannot be safely re-run on already-resolved
+            # "region"/"group" nodes, and a single shared pct map could otherwise clobber
+            # an explicit task-level pct with a same-named region-level default.
+            own_region_pct = {
                 req["region"]: req["pct"]
                 for req in task_region_reqs[i]
                 if "pct" in req
             }
-            ast = resolve_ast_refs(ast, {}, region_pct)
+            ast = resolve_ast_refs(ast, {}, own_region_pct)
+
+            rname_i = task_region[i]
+            if rname_i and parsed_region_prereqs.get(rname_i) is not None:
+                region_ast = parsed_region_prereqs[rname_i]
+                ast = region_ast if ast is None else ("and", [ast, region_ast])
+
             if ast is not None and i in collect_leaves(ast):
                 raise Exception(f"Taskipelago: task {i + 1} cannot require itself.")
             parsed_prereqs.append(ast)
+
+            # Region-level reqs are appended here (display/gating channel only) so they
+            # don't affect the pct map used to resolve the task's own ast above.
+            if rname_i:
+                task_region_reqs[i].extend(region_prereq_reqs.get(rname_i, []))
         _assert_no_cycles(parsed_prereqs, n)
 
         # ------------------------------------------------------------------ #
@@ -757,14 +854,73 @@ class TaskipelagoWorld(World):
                         f"but only {supply} exist. Add more '{cname}' items or reduce costs."
                     )
 
+        # No task/item requirement graph can ever resolve unless at least one task
+        # is completable with nothing collected yet - that's the only way Fill can
+        # ever unlock a first location. Without one, generation always deadlocks,
+        # surfacing later as an opaque Fill.FillError instead of this clear message.
+        if not any(
+            parsed_prereqs[i] is None
+            and parsed_reward_prereqs[i] is None
+            and not task_cost_reqs[i]
+            and not task_region_reqs[i]
+            and not task_progressive_reqs[i]
+            for i in range(n)
+        ):
+            raise Exception(
+                "Taskipelago: no task can be completed without already holding an item, "
+                "another task's token, a region requirement, or a progressive-group "
+                "requirement. At least one task must be free of every prereq/cost so "
+                "generation has somewhere to start - otherwise no location can ever "
+                "become reachable."
+            )
+
         # ------------------------------------------------------------------ #
         # 13. Parse goal tasks                                                #
         # ------------------------------------------------------------------ #
         raw_goal_parts = [str(x).strip() for x in list(self.options.goal_tasks.value or []) if str(x).strip()]
         raw_goal = ", ".join(raw_goal_parts)
-        goal_ast = parse_prereq(raw_goal, n, 0, "goal_tasks") if raw_goal else None
+
+        _goal_resolved, _goal_errs = _resolve_quoted_names(raw_goal, tasks)
+        if _goal_errs:
+            raise Exception(
+                "Taskipelago: goal_tasks references unknown task name(s): " + "; ".join(_goal_errs)
+            )
+        raw_goal = _goal_resolved
+
+        goal_ast_unresolved = parse_prereq(raw_goal, n, 0, "goal_tasks", known_regions=region_set) if raw_goal else None
+
+        goal_region_reqs: List[dict] = []
+        if goal_ast_unresolved is not None:
+            for rname, pct_val in collect_region_refs(goal_ast_unresolved):
+                pct = pct_val if pct_val is not None else region_default_pcts.get(rname, 100)
+                if pct < 0 or pct > 100:
+                    raise Exception(
+                        f"Taskipelago: goal_tasks region prereq '{rname}' percentage {pct} must be 0-100."
+                    )
+                if not region_to_task_indices.get(rname):
+                    raise Exception(
+                        f"Taskipelago: goal_tasks references region '{rname}' which has no tasks assigned."
+                    )
+                goal_region_reqs.append({"region": rname, "pct": pct})
+            for rname, abs_n in collect_region_abs_refs(goal_ast_unresolved):
+                region_size = len(region_to_task_indices.get(rname, []))
+                if region_size == 0:
+                    raise Exception(
+                        f"Taskipelago: goal_tasks references region '{rname}' which has no tasks assigned."
+                    )
+                if abs_n < 1 or abs_n > region_size:
+                    raise Exception(
+                        f"Taskipelago: goal_tasks uses '{rname}*{abs_n}' but region "
+                        f"'{rname}' only has {region_size} task(s)."
+                    )
+                goal_region_reqs.append({"region": rname, "abs_count": abs_n})
+
+        goal_region_pct = {req["region"]: req["pct"] for req in goal_region_reqs if "pct" in req}
+        goal_ast = resolve_ast_refs(goal_ast_unresolved, {}, goal_region_pct)
+
         self._raw_goal = raw_goal
         self._goal_ast = goal_ast
+        self._goal_region_reqs = goal_region_reqs
         self._goal_indices = sorted(set(collect_leaves(goal_ast))) if goal_ast else []
 
         # ------------------------------------------------------------------ #
@@ -804,9 +960,14 @@ class TaskipelagoWorld(World):
         self._task_progressive_reqs = task_progressive_reqs
         self._regions = raw_regions
         self._region_default_pcts = region_default_pcts
+        self._region_colors = region_colors
         self._task_region = task_region
+        self._task_descriptions = raw_task_description
         self._task_region_reqs = task_region_reqs
         self._region_to_task_indices = region_to_task_indices
+        self._region_prereq_text = region_prereq_text
+        self._region_prereq_reqs = region_prereq_reqs
+        self._parsed_region_prereqs = parsed_region_prereqs
         self._consumable_groups = consumable_groups
 
         # Stable per-generation names
@@ -814,8 +975,12 @@ class TaskipelagoWorld(World):
         _pname = self.multiworld.player_name[self.player]
         prefix = f"[{_pname}] " if multi_slot else ""
 
-        self._reward_location_names = [f"{prefix}Task {i + 1} (Reward)" for i in range(n)]
-        self._complete_location_names = [f"{prefix}Task {i + 1} (Complete)" for i in range(n)]
+        self._reward_location_names = [f"{prefix}Task {i + 1} (Reward): {tasks[i]}" for i in range(n)]
+        self._complete_location_names = [f"{prefix}Task {i + 1} (Complete): {tasks[i]}" for i in range(n)]
+
+        for i, is_priority in enumerate(raw_task_priority):
+            if is_priority:
+                self.options.priority_locations.value.add(self._reward_location_names[i])
         self._reward_item_names = [
             f"{prefix}Item {i + 1}: {rewards[i]}" if rewards[i].strip() else f"{prefix}Item {i + 1}"
             for i in range(n)
@@ -836,26 +1001,6 @@ class TaskipelagoWorld(World):
             for cname, idxs in consumable_groups.items()
         }
 
-        # ------------------------------------------------------------------ #
-        # DEBUG LOGGING                                                        #
-        # ------------------------------------------------------------------ #
-        logger.info("=== Taskipelago generate_early ===")
-        logger.info("n_yaml_tasks=%d  n_yaml_items=%d", n, n_yaml_items)
-        for gname, idxs in group_to_reward_indices.items():
-            names = [f"Item {idx+1}: {rewards[idx]}" for idx in idxs]
-            logger.info("group '%s' -> indices %s -> %s", gname, idxs, names)
-        for ti, reqs in enumerate(task_progressive_reqs):
-            if reqs:
-                logger.info("Task %d (%s) progressive reqs: %s", ti + 1, tasks[ti], reqs)
-        for ti, txt in enumerate(raw_reward_prereqs_input):
-            if txt:
-                logger.info("Task %d raw item prereq: %r", ti + 1, txt)
-        for ti, ast in enumerate(parsed_reward_prereqs):
-            if ast is not None:
-                logger.info("Task %d (%s) parsed reward prereq AST: %s", ti + 1, tasks[ti], ast)
-        logger.info("forced_progression_rewards (0-based): %s", sorted(forced_prog))
-        logger.info("=== end generate_early ===")
-
     @classmethod
     def stage_generate_early(cls, multiworld) -> None:
         import worlds as _worlds
@@ -866,45 +1011,45 @@ class TaskipelagoWorld(World):
         item_name_to_id: Dict[str, int] = {}
         location_name_to_id: Dict[str, int] = {}
 
+        def _pc(s):
+            try: return max(1, int(s)) if s else 1
+            except ValueError: return 1
+
         for world in task_worlds:
             p = world.player
             player_name = multiworld.player_name[p]
             prefix = f"[{player_name}] " if multi_slot else ""
 
             tasks = [str(t).strip() for t in world.options.tasks.value if str(t).strip()]
-            items_raw = [str(r).strip() for r in world.options.items.value]
+            items_raw_input = [str(r).strip() for r in world.options.items.value]
 
             # Compute expanded count to size the ID allocation correctly
             task_count_raw = [str(x).strip() for x in (world.options.task_count.value or [])]
             item_count_raw = [str(x).strip() for x in (world.options.item_count.value or [])]
 
-            def _pc(s):
-                try: return max(1, int(s)) if s else 1
-                except ValueError: return 1
-
             task_counts = [_pc(task_count_raw[i] if i < len(task_count_raw) else "") for i in range(len(tasks))]
-            item_counts = [_pc(item_count_raw[i] if i < len(item_count_raw) else "") for i in range(len(tasks))]
             n_tasks = min(sum(task_counts), MAX_TASKS)
 
-            # Expand items_raw to match the expanded task count
-            expanded_items: List[str] = []
-            for i in range(len(tasks)):
-                reward_text = items_raw[i] if i < len(items_raw) else ""
-                for _ in range(item_counts[i]):
-                    expanded_items.append(reward_text)
-            if len(expanded_items) < n_tasks:
-                expanded_items += [""] * (n_tasks - len(expanded_items))
+            # Items are an independent editor list from tasks (their own rows/counts),
+            # matching how generate_early expands them.
+            items_raw_editor, _, _, item_counts_editor = build_item_editor_rows(
+                items_raw_input, [], [], item_count_raw
+            )
+            expanded_items = expand_rows(items_raw_editor, item_counts_editor)
+            expanded_items = pad_or_trim_names(expanded_items, n_tasks)
+            expanded_tasks = expand_rows(tasks, task_counts)[:n_tasks]
 
             for i in range(n_tasks):
-                reward_text = expanded_items[i] if i < len(expanded_items) else ""
+                reward_text = expanded_items[i]
+                task_text = expanded_tasks[i]
                 item_name = (
                     f"{prefix}Item {i + 1}: {reward_text}"
                     if reward_text
                     else f"{prefix}Item {i + 1}"
                 )
                 token_name = f"{prefix}Task {i + 1} Complete"
-                reward_loc_name = f"{prefix}Task {i + 1} (Reward)"
-                complete_loc_name = f"{prefix}Task {i + 1} (Complete)"
+                reward_loc_name = f"{prefix}Task {i + 1} (Reward): {task_text}"
+                complete_loc_name = f"{prefix}Task {i + 1} (Complete): {task_text}"
 
                 item_name_to_id[item_name] = BASE_ITEM_ID + (p - 1) * MAX_TASKS + i
                 item_name_to_id[token_name] = BASE_TOKEN_ID + (p - 1) * MAX_TASKS + i
@@ -972,28 +1117,16 @@ class TaskipelagoWorld(World):
             )
 
         if self._goal_ast is not None:
-            complete_names = self._complete_location_names
-            complete_locs = {
-                i: self.multiworld.get_location(complete_names[i], self.player)
-                for i in collect_leaves(self._goal_ast)
-            }
-            def goal_condition(state, ast=self._goal_ast, locs=complete_locs):
-                def loc_checked(node):
-                    if isinstance(node, int):
-                        return locs[node] in state.locations_checked
-                    op, children = node
-                    if op == "and":
-                        return all(loc_checked(c) for c in children)
-                    return any(loc_checked(c) for c in children)
-                return loc_checked(ast)
+            def goal_condition(state, ast=self._goal_ast, p=self.player,
+                                tn=self._token_item_names, gi=self._group_item_display_names,
+                                rt=self._region_token_names):
+                return eval_node(ast, state, p, tn, gi, rt)
             self.multiworld.completion_condition[self.player] = goal_condition
         else:
-            reward_locs = [
-                self.multiworld.get_location(name, self.player)
-                for name in self._reward_location_names
-            ]
-            self.multiworld.completion_condition[self.player] = lambda state: all(
-                loc in state.locations_checked for loc in reward_locs
+            reward_tokens = list(self._token_item_names)
+            player = self.player
+            self.multiworld.completion_condition[self.player] = lambda state: state.has_all(
+                reward_tokens, player
             )
 
     def fill_slot_data(self) -> Dict[str, Any]:
@@ -1045,6 +1178,7 @@ class TaskipelagoWorld(World):
             "sent_player_names": sent_player_names,
             "goal_indices": sorted(self._goal_indices),
             "goal_expression": self._raw_goal,
+            "goal_region_reqs": list(self._goal_region_reqs),
             "progressive_groups": list(self._progressive_groups),
             "item_progressive_group": list(self._reward_to_group),
             "task_progressive_reqs": [
@@ -1070,12 +1204,15 @@ class TaskipelagoWorld(World):
             },
             "regions": list(self._regions),
             "region_default_pcts": dict(self._region_default_pcts),
+            "region_colors": list(self._region_colors),
             "task_region": list(self._task_region),
             "task_region_reqs": [list(reqs) for reqs in self._task_region_reqs],
+            "task_description": list(self._task_descriptions),
             "bingo_mode": bool(self.options.bingo_mode),
             "bingo_dimension_x": int(self.options.bingo_dimension_x),
             "bingo_dimension_y": int(self.options.bingo_dimension_y),
             "bingoal": int(self.options.bingoal),
+            "task_reward_previews": int(self.options.task_reward_previews),
         }
 
 
@@ -1196,32 +1333,6 @@ def _compute_topo_depths(parsed_prereqs: list, n: int) -> List[int]:
     return depths
 
 
-def _parse_prereq_list(txt: str, task_index: int, n: int, label: str) -> List[int]:
-    """Parse a comma-separated prereq string into a deduplicated list of 0-based indices."""
-    if not txt:
-        return []
-    parts = [p.strip() for p in txt.split(",") if p.strip()]
-    reqs: List[int] = []
-    seen: set = set()
-    for p in parts:
-        try:
-            idx_1 = int(p)
-        except ValueError:
-            raise Exception(
-                f"Taskipelago: invalid {label} '{p}' on task {task_index + 1}. "
-                f"Use comma-separated integers like '1,2'."
-            )
-        if idx_1 < 1 or idx_1 > n:
-            raise Exception(
-                f"Taskipelago: {label} '{idx_1}' on task {task_index + 1} is out of range (1..{n})."
-            )
-        idx_0 = idx_1 - 1
-        if idx_0 not in seen:
-            seen.add(idx_0)
-            reqs.append(idx_0)
-    return reqs
-
-
 def _assert_no_cycles(parsed_prereqs: list, n: int) -> None:
     """DFS cycle detection on the prereq graph."""
     visiting: set = set()
@@ -1240,6 +1351,35 @@ def _assert_no_cycles(parsed_prereqs: list, n: int) -> None:
 
     for i in range(n):
         dfs(i)
+
+
+def _assert_no_region_cycles(region_names: List[str], region_prereq_reqs: Dict[str, List[dict]]) -> None:
+    """3-color DFS cycle detection on the region-dependency graph."""
+    graph = {r: [req["region"] for req in region_prereq_reqs.get(r, [])] for r in region_names}
+    visiting: set = set()
+    visited: set = set()
+    path: List[str] = []
+
+    def dfs(r: str) -> None:
+        if r in visiting:
+            cycle_start = path.index(r)
+            cycle_str = " -> ".join(path[cycle_start:] + [r])
+            raise Exception(
+                f"Taskipelago: region dependency cycle detected: {cycle_str}. "
+                f"Fix your region prereqs."
+            )
+        if r in visited:
+            return
+        visiting.add(r)
+        path.append(r)
+        for dep in graph.get(r, []):
+            dfs(dep)
+        path.pop()
+        visiting.discard(r)
+        visited.add(r)
+
+    for r in region_names:
+        dfs(r)
 
 
 # --- Client launcher registration ---

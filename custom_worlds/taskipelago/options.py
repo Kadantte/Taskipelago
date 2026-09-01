@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import List
 
-from Options import PerGameCommonOptions, DeathLink, OptionList, Toggle, Range
+from Options import PerGameCommonOptions, OptionList, Toggle, Range, Choice
+from Options import DeathLink as APDeathLink
+
+MAX_TASK_DESCRIPTION_LEN = 100
 
 class Tasks(OptionList):
     """
@@ -37,8 +40,16 @@ class TaskPrereqs(OptionList):
     NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
     Parallel list aligned with tasks. Each entry is a boolean expression of 1-based task
     indices that must be completed before this task is accessible.
-    Supports &&, ||, (), and quoted task names (e.g. "My Task").
+    Supports &&, ||, (), quoted task names (e.g. "My Task"), and region references
+    (e.g. 'chores' for the region's default percentage, 'chores-75' for exactly 75%,
+    'chores*5' for an absolute count of 5 tasks).
     Example: '1 && (2 || 3)' requires task 1 and either task 2 or task 3.
+    Two reserved keywords are also available here (not in item_prereqs or goal_tasks):
+    'prev' resolves to the task immediately before this one. 'sequential', combined
+    with a task's count field, makes every duplicate copy after the first depend on
+    the copy before it (e.g. 'sequential && "Chore"' with count 4 leaves the first
+    copy depending only on "Chore", while the rest also require the prior copy).
+    'prev' and 'sequential' cannot be used as region or progressive group names.
     """
     display_name = "Task Prereqs"
     default: List[str] = []
@@ -72,7 +83,7 @@ class HideUnreachableTasks(Toggle):
     default = 1
 
 
-class DeathLink(Toggle):
+class DeathLink(APDeathLink):
     """
     If enabled, receiving deathlinks trigger a weighted random deathlink task from the user supplied deathlink task pool.
     """
@@ -106,10 +117,24 @@ class DeathLinkAmnesty(Range):
     default = 0
 
 
+class TaskPriority(OptionList):
+    """
+    NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
+    Parallel list aligned with tasks. Each entry is 'true' or 'false' (default 'false').
+    Tasks marked 'true' have their reward location added to Archipelago's built-in
+    priority_locations, making it more likely to receive a progression or otherwise
+    important item instead of junk/filler.
+    """
+    display_name = "Task Priority"
+    default: List[str] = []
+
+
 class GoalTasks(OptionList):
     """
     NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
     Boolean expression of 1-based task indices whose completion triggers game completion.
+    Uses the same syntax as task_prereqs: &&, ||, (), quoted task names (e.g. "My Task"),
+    and region references (e.g. 'chores', 'chores-75', 'chores*5').
     If empty, all tasks must be completed (default behaviour).
     """
     display_name = "Goal Tasks"
@@ -159,6 +184,45 @@ class RegionDefaultPcts(OptionList):
     default: List[str] = []
 
 
+class RegionColors(OptionList):
+    """
+    NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
+    Parallel list aligned with regions.
+    Each entry is a hex color string (e.g. '#e05c5c') for that region's color coding.
+    Missing or empty entries will be treated as no color.
+    """
+    display_name = "Region Colors"
+    default: List[str] = []
+
+
+class RegionPrereqs(OptionList):
+    """
+    NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
+    Parallel list aligned with regions.
+    Each entry is a boolean expression, using the same syntax as Task Prereqs' region
+    references, that gates an entire region on OTHER regions being completed:
+        otherregion       -> that region's default percentage of tasks must be completed
+        otherregion-75    -> exactly 75% of that region's tasks must be completed
+        otherregion*5     -> exactly 5 tasks in that region must be completed
+    Combine with &&, ||, and (). A region cannot depend on itself, and dependency
+    cycles between regions are not allowed. Task/item indices and progressive groups
+    are not valid here - only other region names. Missing or empty entries mean the
+    region has no additional requirement of its own.
+    """
+    display_name = "Region Prereqs"
+    default: List[str] = []
+
+
+class TaskDescriptions(OptionList):
+    """
+    NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
+    Parallel list aligned with tasks. Each entry is an optional flavor-text description
+    (max 100 characters) shown under the task name in the client. Leave empty for none.
+    """
+    display_name = "Task Descriptions"
+    default: List[str] = []
+
+
 class TaskRegion(OptionList):
     """
     NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
@@ -168,6 +232,18 @@ class TaskRegion(OptionList):
     A task cannot depend on its own region.
     """
     display_name = "Task Region"
+    default: List[str] = []
+
+
+class ItemFillers(OptionList):
+    """
+    NOTE: The Taskipelago client application contains a YAML builder that is the recommended way to configure this. Editing YAML manually is error-prone.
+    Parallel list aligned with items.
+    Each entry is 'true' or 'false' (default 'false').
+    Items marked as filler are exempt from the duplicate item name check, since filler
+    flavor text is expected to repeat across items.
+    """
+    display_name = "Item Fillers"
     default: List[str] = []
 
 
@@ -257,18 +333,41 @@ class Bingoal(Range):
     default = 3
 
 
+class TaskRewardPreviews(Choice):
+    """
+    Controls whether the client shows a preview of a task's reward (item name and recipient
+    player) once that task becomes available to complete (prereqs satisfied and, if it has a
+    cost, the cost already paid).
+
+    'No Previews' (default) shows nothing and makes no network calls - fully backwards compatible.
+    'Scout Previews' shows the reward using data already resolved locally at generation time,
+    with no additional network traffic.
+    'Hint Previews' does the same, but also sends a real Archipelago hint for that task's reward
+    location the first time it becomes available each session (equivalent to typing !hint).
+    This is a real hint subject to the server's hint point economy and is visible to other players.
+    """
+    display_name = "Task Reward Previews"
+    option_no_previews = 0
+    option_scout_previews = 1
+    option_hint_previews = 2
+    default = 0
+
+
 @dataclass
 class TaskipelagoOptions(PerGameCommonOptions):
     tasks: Tasks
     items: Items
     item_types: ItemTypes
+    item_fillers: ItemFillers
     item_consumable: ItemConsumable
     item_count: ItemCount
     task_count: TaskCount
     task_cost: TaskCost
     task_prereqs: TaskPrereqs
+    task_description: TaskDescriptions
     item_prereqs: ItemPrereqs
     lock_prereqs: LockPreqreqs
+    task_priority: TaskPriority
     goal_tasks: GoalTasks
     hide_unreachable_tasks: HideUnreachableTasks
     death_link: DeathLink
@@ -279,8 +378,11 @@ class TaskipelagoOptions(PerGameCommonOptions):
     item_progressive_group: ItemProgressiveGroup
     regions: Regions
     region_default_pcts: RegionDefaultPcts
+    region_colors: RegionColors
+    region_prereqs: RegionPrereqs
     task_region: TaskRegion
     bingo_mode: BingoMode
     bingo_dimension_x: BingoDimensionX
     bingo_dimension_y: BingoDimensionY
     bingoal: Bingoal
+    task_reward_previews: TaskRewardPreviews
