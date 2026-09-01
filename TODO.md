@@ -19,6 +19,9 @@ take that Jira.
 
 ### Medium Prio:
 * Taskmaster style ui
+* Hints tab
+* Deathlink Alert
+* Deathlink forced task locking others
 
 ### Low Prio:
 * Tasklock integration to force all task locks to be in the taskipelago world (generate tasklock yaml with plando logic included, warn user to enable plando items in host.yaml)
